@@ -1,0 +1,52 @@
+schema: spec-driven
+
+context: |
+  Language: zh
+  All artifacts must be written in zh.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+  CloseWebUI 是从零开始的自托管 AI 聊天产品，未来后端使用 Go，不使用 Python。
+  初始化交付只包含环境与前端规划，任务保持未完成；后续明确请求实施时按 apply 工作流开发。
+  首版为中文、浅色主题、高还原 Claude 核心布局的独立 Mock 前端，使用 CloseWebUI 品牌。
+  前端采用 React、TypeScript、Vite 和 pnpm；Tailwind CSS 与 CSS Variables 管理视觉，Radix UI 管理基础交互。
+  React Router 管理路由，TanStack Query 管理接口数据，Zustand 管理临时界面状态。
+  MSW 模拟 API，带版本号的 localStorage 保存对话；组件只依赖统一 API 层。
+  react-markdown、remark-gfm 和 Shiki 渲染消息；Vitest 验证业务逻辑，Playwright 验证用户流程。
+  首版支持首页、侧栏、历史对话、流式回答、停止、失败重试、重命名、删除和本地恢复。
+  首版不包含真实模型、登录、附件、知识库、工具调用、编辑重发、分支对话和深色主题。
+  视觉验收宽度为 1440、1024、390 像素；重点验收自动滚动、取消生成和中文输入法行为。
+  Git 不自动提交，不配置远程；规格完成不代表实现完成，完成实现后才能归档变更。
+
+rules:
+  proposal:
+    - 明确首版交付、排除项及新增 capability 名称。
+  specs:
+    - 使用标准 Requirement 和 Scenario 结构，要求包含 SHALL 或 MUST。
+    - 写清成功、加载、空状态、错误、取消与刷新恢复行为。
+  design:
+    - 固定视觉变量、接口边界、数据模型、流式取消和 Mock 持久化策略。
+    - 区分已观察的仓库事实与计划引入的技术，记录默认选择。
+  tasks:
+    - 按骨架、布局、Mock、流式聊天、历史管理、验收的依赖顺序编排。
+    - 所有实现任务使用未勾选复选框，并包含具体可验证的验收任务。
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always state what is out of scope
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
