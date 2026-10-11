@@ -2,6 +2,7 @@
   "name": "close-webui",
   "private": true,
   "version": "0.1.0",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "packageManager": "pnpm@11.23.0",
   "scripts": {
@@ -11,7 +12,8 @@
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:e2e": "pnpm build && playwright test"
+    "test:e2e": "pnpm build && playwright test",
+    "test:real-server": "vite build --outDir .test-dist/real && vite preview --outDir .test-dist/real --host localhost --port 4174 --strictPort"
   },
   "dependencies": {
     "@radix-ui/react-alert-dialog": "^1.1.15",

@@ -6,7 +6,9 @@ export async function* readEvents(body: ReadableStream<Uint8Array>, id: string, 
   const aborted = () => { void reader.cancel().catch(() => {}); };
   signal?.addEventListener('abort', aborted, { once: true });
   const parse = (line: string): GenerationEvent => {
-    const event = JSON.parse(line) as GenerationEvent;
+    let event: GenerationEvent;
+    try { event = JSON.parse(line) as GenerationEvent; }
+    catch { throw new Error('回答事件格式无效，请重试。'); }
     if (!event || event.assistantMessageId !== id || !['delta', 'done', 'error'].includes(event.type) ||
       (event.type === 'delta' && typeof event.content !== 'string') ||
       (event.type === 'error' && (typeof event.code !== 'string' || typeof event.message !== 'string'))) throw new Error('回答事件格式无效，请重试。');
@@ -15,9 +17,13 @@ export async function* readEvents(body: ReadableStream<Uint8Array>, id: string, 
   try {
     while (true) {
       signal?.throwIfAborted();
-      const { value, done } = await reader.read();
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try { chunk = await reader.read(); }
+      catch { signal?.throwIfAborted(); throw new Error('回答连接中断，请重试。'); }
+      const { value, done } = chunk;
       signal?.throwIfAborted();
-      buffer += decoder.decode(value, { stream: !done });
+      try { buffer += decoder.decode(value, { stream: !done }); }
+      catch { throw new Error('回答编码无效，请重试。'); }
       let boundary: number;
       while ((boundary = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, boundary).trim(); buffer = buffer.slice(boundary + 1);

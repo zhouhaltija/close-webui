@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import { App, ErrorBoundary } from './App';
 import './styles.css';
+import './reference.css';
 async function start() {
   if (import.meta.env.VITE_ENABLE_MOCK !== 'false') { const { startMock } = await import('./mocks/browser'); await startMock(); }
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false, staleTime: Infinity }, mutations: { retry: false } } });

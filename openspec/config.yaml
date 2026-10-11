@@ -6,7 +6,7 @@ context: |
   Keep OpenSpec structural headings and SHALL/MUST keywords in English.
   CloseWebUI 是从零开始的自托管 AI 聊天产品，未来后端使用 Go，不使用 Python。
   初始化交付只包含环境与前端规划，任务保持未完成；后续明确请求实施时按 apply 工作流开发。
-  首版为中文、浅色主题、高还原 Claude 核心布局的独立 Mock 前端，使用 CloseWebUI 品牌。
+  首版为中文、浅色主题的独立 Mock 前端，使用 CloseWebUI 品牌。用户提供的 Claude 截图用于布局和视觉参考；保留 Sonnet 5.5 · 中等标签及模型选择/努力程度菜单，不显示更多模型、Pro/Max、升级、额度或套餐内容；不增加 Cowork 或未实现服务入口，欢迎语按本地时段随机选择。
   前端采用 React、TypeScript、Vite 和 pnpm；Tailwind CSS 与 CSS Variables 管理视觉，Radix UI 管理基础交互。
   React Router 管理路由，TanStack Query 管理接口数据，Zustand 管理临时界面状态。
   MSW 模拟 API，带版本号的 localStorage 保存对话；组件只依赖统一 API 层。

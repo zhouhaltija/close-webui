@@ -1,10 +1,12 @@
 node_modules/
 dist/
+.test-dist/
 coverage/
 .vite/
 .cache/
 playwright-report/
 test-results/
+/tests/visual/reference-*.png
 .env
 .env.*
 !.env.example
