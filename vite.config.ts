@@ -4,6 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  server: { proxy: { '/api': 'http://127.0.0.1:8080' } },
   build: { rollupOptions: { output: { manualChunks(id) {
     if (!id.includes('node_modules')) return;
     if (id.includes('/react-dom/') || id.includes('/react/') || id.includes('/scheduler/')) return 'react-vendor';

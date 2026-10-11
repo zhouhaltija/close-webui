@@ -2,7 +2,10 @@
 
 ## 项目范围
 
-- 当前交付为中文浅色主题的独立 Mock 聊天前端，使用 CloseWebUI 品牌，未来后端使用 Go。用户提供的 Claude 首页截图用于布局、比例、颜色与字体参考；按后续澄清，只呈现项目已实现的功能。不增加 Cowork、项目/账户/升级、附件或语音占位入口，不预设未来 agent 模式名称。最终模型菜单要求见下一条。
+- 当前新增交付为 `build-multi-provider-backend`：Go + chi + PostgreSQL + pgx + sqlc + goose，多用户用户名密码注册登录、每用户私人供应商与历史、四种协议、七个家族内置思考能力及 Claude 风格供应商/模型/账号设置页。以下首版 Mock 约定仍适用于独立 Mock 模式；真实模式使用 API 返回的启用模型与原生能力，不用固定展示名称假装真实接入。用户已明确授权本轮实施方案。
+- 后端位于 `server/`，本轮单体单实例，不包含共享平台密钥、管理员控制台、邮件找回、第三方登录、附件、知识库、工具调用、计费和配置导入。开发数据库凭据与加密主密钥只放忽略的 `.env.backend.local`；禁止使用 `VITE_` 存放秘密。原前端变更的实机输入法验收仍未完成，不自动勾选或归档。
+
+- 独立 Mock 前端为中文浅色主题，使用 CloseWebUI 品牌。用户提供的 Claude 首页截图用于布局、比例、颜色与字体参考；按后续澄清，只呈现项目已实现的功能。Mock 不增加 Cowork、项目/账户/升级、附件或语音占位入口，不预设未来 agent 模式名称。最终 Mock 模型菜单要求见下一条；真实模式包含上文已实现的账号入口。
 - 模型菜单最终约定：保留 Sonnet 5.5 · 中等默认标签及模型选择/努力程度子菜单，按用户第二张截图呈现名称、说明和选中标记；删除“更多模型”、Pro/Max、升级、额度/套餐/用量提示。该要求已同步到 OpenSpec，模型与努力程度选择仅保留在当前页面会话，不代表已接入真实模型；最新实施证据见 HANDOFF.md 顶部。
 - 首版包含首页、历史侧栏、流式聊天、停止、失败重试、Markdown/代码复制、重命名、删除和本地恢复。
 - 首版不包含真实模型、登录、附件、知识库、工具调用、编辑重发、分支对话或深色主题。扩展范围先更新规划。
@@ -37,6 +40,25 @@ pnpm preview
 
 开发地址为 `http://localhost:5173`，生产预览为 `http://localhost:4173`，只绑定 localhost。E2E 自动构建并启动独立的 4173 Mock 预览及 4174 真实接口模式预览，不复用已有服务器。后者通过 `test:real-server` 构建至忽略的 `.test-dist/real/`，关闭 Mock 并使用 `/integration-api` 基址；测试通过浏览器网络边界提供响应，不需要 Go 后端。
 
+### Go 后端与真实联调
+
+需要 Go 1.27+；本机已校验 Go 1.27.2，缓存路径为 `.cache/toolchain/go/bin/go.exe`，脚本优先使用缓存，其他机器回退系统 Go。sqlc 1.30.0 为代码生成工具，服务不要求全局 goose CLI；迁移嵌入二进制。后端运行依赖及完整许可证见 `server/THIRD_PARTY_NOTICES.md`。
+
+后端从仓库根部忽略的 `.env.backend.local` 读取配置，示例见 `server/.env.example`。实际数据库凭据和 32 字节随机加密主密钥不得进入 Git；主密钥需保存，修改后原供应商密钥不能解密。开发库已建表，TLS 未启用；生产要求 `COOKIE_SECURE=true`、HTTPS `PUBLIC_ORIGIN` 与 PostgreSQL `sslmode=require/verify-ca/verify-full`。
+
+```powershell
+pnpm server:migrate  # 显式执行 goose up
+pnpm server:dev      # 127.0.0.1:8080 Go 服务
+pnpm dev:real        # 另一个终端启动 5173 真实前端，/api 同源代理至 8080
+pnpm server:test
+pnpm server:vet
+pnpm server:build    # 构建真实前端 dist 及 .cache/bin 中的服务二进制
+```
+
+`pnpm dev` 与常规 `pnpm build` 仍为独立 Mock 默认入口；`pnpm build:real` 明确构建真实前端。运行服务二进制时应以 `server/` 为工作目录，默认托管 `../dist`。部署由 HTTPS 反向代理转发，流式路由关闭缓冲。内网网关必须通过 `UPSTREAM_ALLOWED_HOSTS` 精确填写 `host:port` 允许；用户不能自行放开出站策略。
+
+完整 E2E 增加 4175 真实 Go 模式：启动本地仿真上游、独立 `closewebui_e2e_<随机ID>` schema 和 `.test-dist/backend`；结束经测试专用关闭入口等待 schema 清理。Go 数据库测试也使用独立随机 schema；不得对 public 或用户数据库做测试回滚。此测试入口只存在于 `cmd/testserver`，生产服务不包含。实网供应商尚无密钥，不能把仿真成功表达为真实调用已经通过。
+
 首次 E2E 前运行 `pnpm exec playwright install chromium`。本机已安装 Chrome，可使用：
 
 ```powershell
@@ -59,6 +81,7 @@ openspec validate build-chat-frontend --strict
 ```
 
 - 当前变更为 `openspec/changes/build-chat-frontend/`，读取 proposal、三份 specs、design 和 tasks 后再实施。
+- 多供应商后端当前变更为 `openspec/changes/build-multi-provider-backend/`，实施以其 proposal、五份 specs、design、tasks 和 CLI apply 进度为准；原前端 Mock 变更继续保留。
 - 使用 `.agents/skills/` 中的 OpenSpec 技能；新增变更使用 propose，实施使用 apply，修订规划使用 update-change。
 - 按骨架与主题 → 页面布局 → Mock 与持久化 → 流式聊天 → 历史管理 → 集成与视觉验收推进。
 - 规划齐全不代表实现完成；未勾选项也可能已有实现。先核对代码和验收条件，再补齐缺口。

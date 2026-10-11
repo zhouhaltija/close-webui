@@ -1,3 +1,5 @@
 import { create } from 'zustand';
-type UIState = { collapsed: boolean; mobileOpen: boolean; busy: boolean; error: string; model: string; effort: string; drafts: Record<string, string>; draft: (id: string, value: string) => void };
-export const useUI = create<UIState>(set => ({ collapsed: false, mobileOpen: false, busy: false, error: '', model: 'Sonnet 5.5', effort: '中等', drafts: {}, draft: (id, value) => set(s => ({ drafts: { ...s.drafts, [id]: value } })) }));
+import type { Reasoning } from './types';
+type UIState = { collapsed: boolean; mobileOpen: boolean; busy: boolean; error: string; model: string; effort: string; realModelId: string | null; reasoning: Reasoning; drafts: Record<string, string>; draft: (id: string, value: string) => void };
+export const useUI = create<UIState>(set => ({ collapsed: false, mobileOpen: false, busy: false, error: '', model: 'Sonnet 5.5', effort: '中等', realModelId: null, reasoning: {}, drafts: {}, draft: (id, value) => set(s => ({ drafts: { ...s.drafts, [id]: value } })) }));
+export function clearPrivateUI() { useUI.setState({ mobileOpen: false, busy: false, error: '', realModelId: null, reasoning: {}, drafts: {}, model: 'Sonnet 5.5', effort: '中等' }); }

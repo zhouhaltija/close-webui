@@ -8,9 +8,11 @@ export class GenerationCoordinator {
   constructor(private deps: GenerationDependencies) {}
   get isActive() { return this.active !== undefined; }
   get conversationId(): string | undefined { return this.active?.id; }
-  async send(content: string, id?: string, retry?: GenerationInput): Promise<boolean> {
+  async send(content: string, id?: string, retry?: GenerationInput, selection?: Pick<GenerationInput, 'modelId' | 'reasoning'>): Promise<boolean> {
     if (this.active || !content.trim()) return false;
-    const active = { controller: new AbortController(), id, input: retry ?? { content, userMessageId: crypto.randomUUID(), assistantMessageId: crypto.randomUUID(), retry: false }, conversation: undefined as Conversation | undefined, accepted: false };
+    const input: GenerationInput = structuredClone(retry ?? { content, userMessageId: crypto.randomUUID(), assistantMessageId: crypto.randomUUID(), retry: false, ...selection });
+    if (selection || input.modelId) input.generationId = crypto.randomUUID();
+    const active = { controller: new AbortController(), id, input, conversation: undefined as Conversation | undefined, accepted: false };
     this.active = active; this.deps.busy(true); this.deps.error('');
     const current = () => this.active === active && !active.controller.signal.aborted;
     const publish = () => { if (active.conversation) this.deps.publish(structuredClone(active.conversation)); };
@@ -26,9 +28,9 @@ export class GenerationCoordinator {
       if (!current()) return false;
       active.accepted = true;
       const c = active.conversation!; const now = new Date().toISOString();
-      if (active.input.retry) { const m = c.messages.find(m => m.id === active.input.assistantMessageId)!; m.content = ''; m.status = 'pending'; delete m.error; }
+      if (active.input.retry) { const m = c.messages.find(m => m.id === active.input.assistantMessageId)!; m.content = ''; m.status = 'pending'; m.generationId = active.input.generationId; delete m.error; }
       else {
-        c.messages.push({ id: active.input.userMessageId, conversationId: c.id, role: 'user', content: active.input.content, status: 'completed', createdAt: now }, { id: active.input.assistantMessageId, conversationId: c.id, role: 'assistant', content: '', status: 'pending', createdAt: now }); c.updatedAt = now;
+        c.messages.push({ id: active.input.userMessageId, conversationId: c.id, role: 'user', content: active.input.content, status: 'completed', createdAt: now }, { id: active.input.assistantMessageId, conversationId: c.id, role: 'assistant', content: '', status: 'pending', createdAt: now, ...(active.input.modelId ? { modelId: active.input.modelId, generationId: active.input.generationId, reasoning: active.input.reasoning } : {}) }); c.updatedAt = now;
       }
       this.deps.accepted(c.id); publish();
       if (!response.body) throw new Error('没有收到回答内容，请重试。');
@@ -57,6 +59,7 @@ export class GenerationCoordinator {
   stop() {
     const active = this.active; if (!active) return;
     this.active = undefined; active.controller.abort();
+    if (active.id && active.input.generationId) void this.deps.api.stop?.(active.id, active.input.generationId).catch(error => this.deps.error(errorText(error)));
     const snapshot = active.id ? this.deps.terminate?.(active.id, active.input.assistantMessageId, 'stopped') : undefined;
     if (snapshot) this.deps.publish(snapshot);
     else if (active.accepted && active.conversation) { const m = active.conversation.messages.find(m => m.id === active.input.assistantMessageId); if (m && ['pending', 'streaming'].includes(m.status)) m.status = 'stopped'; this.deps.publish(structuredClone(active.conversation)); }

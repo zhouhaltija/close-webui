@@ -1,9 +1,19 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Route } from '@playwright/test';
+
+async function identityAndModels(route: Route) {
+  const path = new URL(route.request().url()).pathname;
+  if (path.endsWith('/auth/me')) { await route.fulfill({ json: { id: 'synthetic-user', username: 'synthetic_user' } }); return true; }
+  if (path.endsWith('/providers')) { await route.fulfill({ json: [{ id: 'synthetic-provider', name: '接口测试供应商', templateId: 'custom', protocol: 'openai-chat', adapter: 'standard', baseUrl: 'https://example.invalid/v1', enabled: true, hasKey: true }] }); return true; }
+  if (path.endsWith('/models')) { await route.fulfill({ json: [{ id: 'service-model', providerId: 'synthetic-provider', modelId: 'custom-text', name: '服务测试模型', enabled: true, maxOutputTokens: 4096, defaultReasoning: {}, capabilities: { family: '', efforts: [], supportsToggle: false, mandatory: false, budgetMin: 0, budgetMax: 0, budgetSupported: false, outputMax: 4096, sources: [], known: false } }] }); return true; }
+  if (path.endsWith('/preferences')) { await route.fulfill({ json: { defaultModelId: 'service-model' } }); return true; }
+  return false;
+}
 
 test('disabled Mock uses the configured API and preserves input on service failure', async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem('closewebui:data:v1', '{untouched'));
   const paths: string[] = [];
   await page.route('**/integration-api/**', async route => {
+    if (await identityAndModels(route)) return;
     paths.push(new URL(route.request().url()).pathname);
     await route.fulfill({ status: 503, json: { error: { code: 'UNAVAILABLE', message: '服务暂时不可用。' } } });
   });
@@ -20,7 +30,7 @@ test('disabled Mock uses the configured API and preserves input on service failu
 });
 
 test('disabled Mock presents Chinese feedback for a disconnected service', async ({ page }) => {
-  await page.route('**/integration-api/**', route => route.abort('failed'));
+  await page.route('**/integration-api/**', async route => { if (await identityAndModels(route)) return; await route.abort('failed'); });
   await page.goto('/'); await expect(page.getByText('无法加载历史')).toBeVisible();
   await page.getByRole('textbox', { name: '输入消息' }).fill('重新连接后发送');
   await page.getByRole('button', { name: '发送消息' }).click();
@@ -32,6 +42,7 @@ test('disabled Mock reads service NDJSON without using the fixed fixture', async
   const date = '2026-10-10T00:00:00Z';
   const conversation = { id: 'service-chat', title: '接口对话', createdAt: date, updatedAt: date, messages: [] };
   await page.route('**/integration-api/**', async route => {
+    if (await identityAndModels(route)) return;
     const request = route.request(); const path = new URL(request.url()).pathname;
     if (path.endsWith('/generations')) {
       const { assistantMessageId } = request.postDataJSON();

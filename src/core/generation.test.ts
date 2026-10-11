@@ -43,3 +43,28 @@ it('a cancelled old create cannot navigate or release a newer generation slot', 
   const id = h.published.at(-1)!.messages[1].id; h.event({ type: 'done', assistantMessageId: id }); await latest;
   expect(h.busy.at(-1)).toBe(false);
 });
+
+it('snapshots the model and reasoning and assigns a fresh generation ID when retrying', async () => {
+  const h = harness(); const inputs: GenerationInput[] = []; const original = h.api.generate;
+  h.api.generate = async (id, input, signal) => { inputs.push(structuredClone(input)); return original(id, input, signal); };
+  const g = new GenerationCoordinator(h.deps);
+  const pending = g.send('问题', 'chat', undefined, { modelId: 'model-a', reasoning: { effort: 'high' } }); await flush();
+  const answer = h.published.at(-1)!.messages[1];
+  h.event({ type: 'error', assistantMessageId: answer.id, code: 'UPSTREAM', message: '失败' }); await pending;
+  expect(answer).toMatchObject({ modelId: 'model-a', reasoning: { effort: 'high' }, generationId: expect.any(String) });
+  h.replace(h.published.at(-1)!);
+  const retry = g.send('问题', 'chat', { ...inputs[0], retry: true }, { modelId: 'model-b', reasoning: { effort: 'low' } }); await flush();
+  h.event({ type: 'done', assistantMessageId: answer.id }); await retry;
+  expect(inputs[1]).toMatchObject({ modelId: 'model-a', reasoning: { effort: 'high' }, retry: true });
+  expect(inputs[1].generationId).not.toBe(inputs[0].generationId);
+});
+
+it('sends an explicit stop before the generation response is accepted', async () => {
+  const h = harness(); let stopped: string[] = [];
+  h.api.generate = (_id, _input, signal) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+  h.api.stop = async (id, generationId) => { stopped = [id, generationId]; };
+  const g = new GenerationCoordinator(h.deps); const pending = g.send('问题', 'chat', undefined, { modelId: 'model-a' }); await flush();
+  g.stop(); await pending;
+  expect(stopped[0]).toBe('chat'); expect(stopped[1]).toMatch(/^[0-9a-f-]{36}$/);
+  expect(h.accepted).toEqual([]);
+});

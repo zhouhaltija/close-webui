@@ -1,6 +1,7 @@
 schema: spec-driven
 
 context: |
+  当前新增变更 build-multi-provider-backend 已由用户明确批准实施：Go + chi + PostgreSQL + pgx + sqlc + goose；多用户账号、私人供应商、四种模型协议、七家族内置原生思考能力与 Claude 风格设置页。首版 Mock 下述约定仍适用于独立 Mock 模式；真实模式的模型由当前用户配置和后端能力驱动。凭据仅存忽略的服务端环境文件。本轮不自动提交、推送或归档。
   Language: zh
   All artifacts must be written in zh.
   Keep OpenSpec structural headings and SHALL/MUST keywords in English.

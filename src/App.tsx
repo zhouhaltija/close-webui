@@ -6,7 +6,7 @@ import * as AlertDialog from '@radix-ui/react-alert-dialog';
 import * as Dropdown from '@radix-ui/react-dropdown-menu';
 import * as Tooltip from '@radix-ui/react-tooltip';
 import { ArrowDown, Menu, MoreHorizontal, PanelLeft, Plus, Search, SlidersHorizontal } from 'lucide-react';
-import { api } from './core/api';
+import { accountApi, api, sessionRequestRevision } from './core/api';
 import { ApiError, errorText } from './core/errors';
 import { GenerationCoordinator } from './core/generation';
 import { getGreeting } from './core/greetings';
@@ -17,6 +17,10 @@ import { Composer } from './components/Composer';
 import { Mark } from './components/Brand';
 import { IconButton } from './components/IconButton';
 import { MessageView } from './components/Messages';
+import { AuthBoundary, UserMenu } from './components/Auth';
+import { Settings } from './components/Settings';
+import { RealModelSelector } from './components/RealModelSelector';
+import { reasoningError } from './components/ReasoningFields';
 
 export class ErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
@@ -32,8 +36,22 @@ function Recovery() {
 }
 
 export function App() {
+  const location = useLocation();
+  if (import.meta.env.VITE_ENABLE_MOCK === 'false') return <AuthBoundary>{location.pathname.startsWith('/settings') ? <Settings /> : <ChatApp real />}</AuthBoundary>;
+  return <ChatApp />;
+}
+
+function ChatApp({ real = false }: { real?: boolean }) {
   const { conversationId } = useParams(); const navigate = useNavigate(); const location = useLocation(); const client = useQueryClient();
   const ui = useUI(); const { blocked, warning } = useRuntime();
+  const models = useQuery({ queryKey: ['models'], queryFn: accountApi.models, enabled: real });
+  const providers = useQuery({ queryKey: ['providers'], queryFn: accountApi.providers, enabled: real });
+  const preferences = useQuery({ queryKey: ['preferences'], queryFn: accountApi.preferences, enabled: real });
+  const availableModels = (models.data || []).filter(model => model.enabled && providers.data?.some(provider => provider.id === model.providerId && provider.enabled));
+  const chosenId = ui.realModelId ?? preferences.data?.defaultModelId;
+  const selected = availableModels.find(model => model.id === chosenId);
+  const reasoning = ui.realModelId ? ui.reasoning : selected?.defaultReasoning || {};
+  const parameterError = selected ? reasoningError(reasoning, selected.capabilities, selected.maxOutputTokens) : '';
   const list = useQuery({ queryKey: ['conversations'], queryFn: api.list, enabled: !blocked });
   const detail = useQuery({ queryKey: ['conversation', conversationId], queryFn: () => api.get(conversationId!), enabled: !!conversationId && !blocked });
   const [manage, setManage] = useState<{ mode: 'rename' | 'delete'; conversation: ConversationSummary }>(); const [title, setTitle] = useState(''); const [manageError, setManageError] = useState(''); const [saving, setSaving] = useState(false);
@@ -55,9 +73,13 @@ export function App() {
       return [...(previous || []).filter(item => item.id !== id), { id, title, createdAt, updatedAt }].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
     });
   };
-  const [generation] = useState(() => new GenerationCoordinator({ api, publish, busy: busy => useUI.setState({ busy }), error: error => useUI.setState({ error }), accepted: id => { useUI.getState().draft(id, ''); useUI.getState().draft('home', ''); }, navigate: id => { useUI.getState().draft(id, useUI.getState().drafts.home || ''); navigate(`/chat/${id}`); }, terminate: runtime.terminate }));
+  const [generation] = useState(() => {
+    const ownerRevision = sessionRequestRevision();
+    return new GenerationCoordinator({ api, publish, busy: busy => useUI.setState({ busy }), error: error => { if (!real || ownerRevision === sessionRequestRevision()) useUI.setState({ error }); }, accepted: id => { useUI.getState().draft(id, ''); useUI.getState().draft('home', ''); }, navigate: id => { useUI.getState().draft(id, useUI.getState().drafts.home || ''); navigate(`/chat/${id}`); }, terminate: runtime.terminate });
+  });
   useEffect(() => { if (generation.isActive && generation.conversationId !== conversationId) generation.stop(); useUI.setState({ mobileOpen: false }); }, [conversationId, location.pathname, generation]);
   useEffect(() => { const stop = () => generation.stop(); window.addEventListener('pagehide', stop); return () => { window.removeEventListener('pagehide', stop); generation.stop(); }; }, [generation]);
+  useEffect(() => { const stop = () => generation.stop(); window.addEventListener('closewebui:session-end', stop); return () => window.removeEventListener('closewebui:session-end', stop); }, [generation]);
   const scroll = useRef<HTMLDivElement>(null); const follow = useRef(true); const lastTop = useRef(0); const [away, setAway] = useState(false);
   useLayoutEffect(() => { follow.current = true; setAway(false); const el = scroll.current; if (el) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }, [conversationId]);
   useLayoutEffect(() => { const el = scroll.current; if (el && follow.current) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }, [detail.data]);
@@ -87,11 +109,12 @@ export function App() {
       <div className="history-label"><span>对话记录</span><Dropdown.Root><Dropdown.Trigger asChild><button className="icon-button history-filter" aria-label="历史排序"><SlidersHorizontal size={15} strokeWidth={1} /></button></Dropdown.Trigger><Dropdown.Portal><Dropdown.Content className="dropdown" align="end"><Dropdown.RadioGroup value={historyOrder} onValueChange={setHistoryOrder}><Dropdown.RadioItem value="recent">最近更新</Dropdown.RadioItem><Dropdown.RadioItem value="title">按标题排序</Dropdown.RadioItem></Dropdown.RadioGroup></Dropdown.Content></Dropdown.Portal></Dropdown.Root></div>
       <nav aria-label="历史对话" className="history-list">{list.isPending ? <p className="sidebar-empty">正在加载…</p> : list.isError ? <div className="sidebar-empty">无法加载历史<button className="text-button" onClick={() => void list.refetch()}>重试</button></div> : !history.length ? <div className="sidebar-empty">还没有对话</div> : history.map(c => <div key={c.id} className={`history-row ${conversationId === c.id ? 'selected' : ''}`}><button onClick={() => go(c.id)} className="history-link" title={c.title}>{c.title}</button><Dropdown.Root><Dropdown.Trigger asChild><button className="icon-button history-menu" data-menu-id={c.id} aria-label={`对话菜单：${c.title}`}><MoreHorizontal size={16} strokeWidth={1.3} /></button></Dropdown.Trigger><Dropdown.Portal><Dropdown.Content className="dropdown" sideOffset={5} align="end"><Dropdown.Item onSelect={() => openManage('rename', c, mobile)}>重命名</Dropdown.Item><Dropdown.Item className="danger-text" onSelect={() => openManage('delete', c, mobile)}>删除</Dropdown.Item></Dropdown.Content></Dropdown.Portal></Dropdown.Root></div>)}</nav>
     </div>
-    <div className="sidebar-footer"><button className="sidebar-search" aria-label="搜索对话" onClick={e => { toolFocus.current = e.currentTarget; setSearchText(''); setSearchOpen(true); }}><Search size={16} strokeWidth={1.3} /><span>搜索对话</span></button></div>
+    <div className="sidebar-footer"><button className="sidebar-search" aria-label="搜索对话" onClick={e => { toolFocus.current = e.currentTarget; setSearchText(''); setSearchOpen(true); }}><Search size={16} strokeWidth={1.3} /><span>搜索对话</span></button></div>{real && <UserMenu />}
   </div>;
   if (blocked) return <Recovery />;
   const draftId = conversationId || 'home'; const value = ui.drafts[draftId] || ''; const c = detail.data;
-  const composer = <Composer value={value} onChange={v => ui.draft(draftId, v)} onSend={() => { follow.current = true; setAway(false); void generation.send(value, conversationId); }} onStop={() => generation.stop()} busy={ui.busy} disabled={!!conversationId && (!c || detail.isError)} home={!conversationId} />;
+  const modelError = models.error || providers.error || preferences.error;
+  const composer = <><Composer value={value} onChange={v => ui.draft(draftId, v)} onSend={() => { follow.current = true; setAway(false); void generation.send(value, conversationId, undefined, real && selected ? { modelId: selected.id, reasoning } : undefined); }} onStop={() => generation.stop()} busy={ui.busy} disabled={!!conversationId && (!c || detail.isError)} sendDisabled={real && (!selected || !!parameterError || !!modelError || preferences.isPending)} home={!conversationId} modelSelector={real ? <RealModelSelector models={availableModels} selected={selected} reasoning={reasoning} /> : undefined} />{real && modelError && <p className="submit-error" role="alert">{errorText(modelError)}<button className="text-button" onClick={() => { void models.refetch(); void providers.refetch(); void preferences.refetch(); }}>重新加载模型配置</button></p>}{real && parameterError && <p className="submit-error" role="alert">{parameterError}</p>}</>;
   return <Tooltip.Provider delayDuration={250}><div className={`app-shell ${ui.collapsed ? 'sidebar-collapsed' : ''}`}>
     <aside className="desktop-sidebar">{sidebar()}</aside>
     <Dialog.Root open={ui.mobileOpen} onOpenChange={mobileOpen => useUI.setState({ mobileOpen })}><Dialog.Trigger asChild><button className="mobile-menu icon-button" aria-label="打开侧栏"><Menu size={21} /></button></Dialog.Trigger><Dialog.Portal><Dialog.Overlay className="overlay drawer-overlay" /><Dialog.Content className="mobile-drawer"><Dialog.Title className="sr-only">对话导航</Dialog.Title><Dialog.Description className="sr-only">新建对话，查看和管理历史记录</Dialog.Description>{sidebar(true)}</Dialog.Content></Dialog.Portal></Dialog.Root>
@@ -99,7 +122,7 @@ export function App() {
       {warning && <div className="storage-warning" role="alert">{warning}</div>}
       {!conversationId ? <section className="home-view"><div className="home-inner"><div className="welcome"><Mark large /><h2>{greeting}</h2></div>{composer}{ui.error && <p className="submit-error" role="alert">{ui.error}</p>}</div></section> : <>
         <div className="conversation-scroll" ref={scroll} onScroll={() => { const el = scroll.current; if (!el) return; if (el.scrollTop < lastTop.current - 2) follow.current = false; if (el.scrollHeight - el.clientHeight - el.scrollTop <= 80) follow.current = true; lastTop.current = el.scrollTop; setAway(!follow.current); }}>
-          <div className="conversation-content">{detail.isPending ? <p className="loading-state" role="status">正在加载对话…</p> : detail.isError ? <div className="empty-detail"><h2>{detail.error instanceof ApiError && detail.error.status === 404 ? '对话不存在' : '无法加载对话'}</h2><p>{errorText(detail.error)}</p>{detail.error instanceof ApiError && detail.error.status === 404 ? <button className="secondary-button" onClick={() => go()}>返回新对话</button> : <button className="secondary-button" onClick={() => void detail.refetch()}>重试</button>}</div> : c?.messages.length ? c.messages.map((m, i) => <MessageView key={m.id} message={m} canRetry={m.status === 'failed' && i === c.messages.length - 1 && !ui.busy} onRetry={() => { const user = c.messages[i - 1]; if (user) { follow.current = true; void generation.send(user.content, c.id, { content: user.content, userMessageId: user.id, assistantMessageId: m.id, retry: true }); } }} />) : <div className="empty-detail"><Mark large /><h2>给这个对话一个起点</h2><p>在下方写下你的想法。</p></div>}</div>
+          <div className="conversation-content">{detail.isPending ? <p className="loading-state" role="status">正在加载对话…</p> : detail.isError ? <div className="empty-detail"><h2>{detail.error instanceof ApiError && detail.error.status === 404 ? '对话不存在' : '无法加载对话'}</h2><p>{errorText(detail.error)}</p>{detail.error instanceof ApiError && detail.error.status === 404 ? <button className="secondary-button" onClick={() => go()}>返回新对话</button> : <button className="secondary-button" onClick={() => void detail.refetch()}>重试</button>}</div> : c?.messages.length ? c.messages.map((m, i) => <MessageView key={m.id} message={m} canRetry={m.status === 'failed' && i === c.messages.length - 1 && !ui.busy} onRetry={() => { const user = c.messages[i - 1]; if (user) { follow.current = true; void generation.send(user.content, c.id, { content: user.content, userMessageId: user.id, assistantMessageId: m.id, retry: true, ...(real ? { modelId: m.modelId, reasoning: m.reasoning } : {}) }); } }} />) : <div className="empty-detail"><Mark large /><h2>给这个对话一个起点</h2><p>在下方写下你的想法。</p></div>}</div>
         </div><div className="conversation-bottom">{away && <button className="back-bottom" onClick={() => { follow.current = true; setAway(false); const el = scroll.current; if (el) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }}><ArrowDown size={15} />回到底部</button>}{ui.error && <p className="submit-error" role="alert">{ui.error}</p>}{composer}<p className="chat-footnote">回答可能有误，请核实重要信息。</p></div>
       </>}
     </main>
