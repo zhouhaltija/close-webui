@@ -139,6 +139,28 @@ func run() error {
 					}
 				}
 			}
+		} else if strings.Contains(last, "[perf]") {
+			// Fixed cadence performance fixture: one chunk every 50ms, 20k characters
+			// including a code fence and a Markdown table, so the browser measurement
+			// exercises long answers and repeated highlighting.
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			filler := strings.Repeat("性能采样内容 ", 62)
+			chunks := []string{"# 性能采样\n\n"}
+			for i := 0; i < 40; i++ {
+				chunks = append(chunks, filler)
+			}
+			chunks = append(chunks, "\n\n| 列一 | 列二 |\n| --- | --- |\n| 甲 | 乙 |\n\n```go\npackage main\n\nfunc main() { println(\"CloseWebUI\") }\n```\n")
+			for _, chunk := range chunks {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-ticker.C:
+					if !send(chunk) {
+						return
+					}
+				}
+			}
 		} else {
 			if !send("这条回答经过真实 Go 服务和 PostgreSQL 保存；模型上游为本地仿真。\n\n") {
 				return

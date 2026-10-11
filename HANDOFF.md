@@ -1,3 +1,54 @@
+# 六项体验修复交付记录（2026-10-11）
+
+OpenSpec 变更 `fix-provider-setup-and-chat-experience` 已按 proposal/specs/design/tasks 实施完毕，**未 Git 提交、未推送、未归档**，差异全部留在工作区供原协作者独立审核。基线提交 `29483aa`。本轮同时保留原规划文件（`openspec/changes/fix-provider-setup-and-chat-experience/` 仍未跟踪）。
+
+## 六项修复逐项对照
+
+| # | 问题 | 主要修改文件 | 红→绿测试 |
+| --- | --- | --- | --- |
+| 1 | 模型菜单变成居中 Dialog | `src/components/RealModelSelector.tsx`（重写为 Radix Dropdown + Sub，复用 `ModelSelector` 的 `.model-menu/.effort-menu` CSS 与跨子菜单指针逻辑）、`src/settings.css`（新增 `.model-search/.model-empty/.model-menu-footer/.effort-menu-native`，删除 `.real-model-*`）、`src/RealApp.test.tsx` | `src/components/RealModelSelector.test.tsx` 9 项：锚定下拉而非 dialog、名称/精确 ID/勾选、切换恢复该模型默认思考、仅合法原生控制（mandatory 模型无开关）、未知能力无假档位、Escape 关闭、草稿保留、设置入口、非法组合告警 |
+| 2 | 账号菜单只有文字可点 | `src/styles.css`（`.dropdown [role=menuitem]` 增加 `display:block;box-sizing:border-box;width:100%`，Link 保持真实链接语义）、`tests/e2e/fixes.spec.ts` | Playwright `the account menu row is clickable across its whole width`：对设置行**左缘/中点/右缘/内边距**四个真实坐标点击均进入设置页；分隔线外侧与菜单外点击不误退出 |
+| 3 | 供应商与模型配置割裂 | `src/components/ProviderWorkspace.tsx`（新建，224px 供应商列表 + 内联详情 + 下部模型管理）、`src/components/Settings.tsx`（三列外壳；Models 改全局汇总）、`src/core/api.ts`、`src/core/types.ts`、`src/settings.css`、`src/main.tsx`（新增 `/settings/providers/:providerId` 路由）、`src/components/Settings.test.tsx`（19 项） | 迟到发现不覆盖新供应商、未保存草稿不静默丢失、密钥留空不发送 `apiKey`、批量添加逐项结果且已存在不改写、停用供应商不写模型开关、390px 逐级切换与返回入口、默认模型不可用明确提示不自动替换 |
+| 4 | 能力需手填、截图 GLM 不识别 | `server/internal/upstream/catalog.go`（新建，版本化可枚举目录，能力一律复用 `registry.go`）、`server/internal/upstream/registry.go`（新增 siliconflow 精确别名 `zai-org/GLM-5.3-Flash`）、`server/internal/app/model_discovery.go`（新建 `model-candidates`/`model-catalog`/`models/batch`）、`server/internal/app/app.go`（路由）、`server/internal/upstream/catalog_test.go`、`server/internal/app/model_discovery_test.go` | 精确匹配且小写/去前缀均不匹配、默认输出 `min(4096, outputMax)`、上游成功/空列表回落/401/403/超时/非法响应/内置无项/跨用户 404、批量去重与逐项失败、旧 `discover` 数组契约仍通过 |
+| 5 | 发送后空对话等待 | `src/core/generation.ts`（提交预览与已确认消息分离、ID 对账、rAF 合并、不可变消息更新）、`src/App.tsx`（`/chat/pending` 本地路由 + 预览渲染 + `load` 复用缓存）、`src/core/ui-store.ts`、`src/core/types.ts`、`src/components/Composer.tsx`（单一稳定发送/停止按钮）、`src/core/generation.test.ts`（14 项）、`tests/e2e/responsiveness.spec.ts` | 慢 create/generate 各 2s 时 100ms 内显示用户消息与"正在提交…"、无空欢迎页、成功按 ID 合并且不重复、失败恢复草稿、停止不复活迟到预览、未变更消息保持引用 |
+| 6 | 人为流式停顿 | `server/internal/app/generations.go`（`appendDelta` 改单条 CTE 原子 SQL：4 次往返 → 1 次；40ms 合并窗口 + 有界队列 + 单写入协程 + 终结排空）、`server/internal/app/generations_perf_test.go`、`src/components/Messages.tsx`（`memo` + `MessageBody`）、`server/cmd/testserver/main.go`（新增 `[perf]` 固定 50ms、20k 字符、代码块与表格仿真）、`tests/e2e/performance.spec.ts` | 原子 SQL 归属/影响行数/活动 ID 条件、并发停止/删除/重试、单请求锁、四协议首段/高频/背压/EOF/错误/终结排空/写失败；渲染只更新活动助手消息 |
+
+## 已取得的验证结果（实际命令与退出码）
+
+| 检查 | 命令 | 结果 |
+| --- | --- | --- |
+| 前端类型 | `node_modules\.bin\tsc -b` | **exit 0** |
+| 前端 lint | `node_modules\.bin\eslint .` | **exit 0** |
+| 前端单测 | `node_modules\.bin\vitest run` | **exit 0，13 文件 114 测试通过** |
+| OpenSpec | `openspec validate fix-provider-setup-and-chat-experience --strict` | **exit 0，Change is valid** |
+| Go 构建 | `go build ./...`（`GOCACHE/GOPATH/GOMODCACHE` 指向仓库 `.cache`） | **exit 0** |
+| 差异卫生 | `git diff --check` | **exit 0** |
+
+新增测试文件：`src/components/RealModelSelector.test.tsx`、`src/components/Settings.test.tsx`、`src/core/generation.test.ts`（扩充）、`server/internal/upstream/catalog_test.go`、`server/internal/app/model_discovery_test.go`、`server/internal/app/generations_perf_test.go`、`tests/e2e/{fixes,responsiveness,performance}.spec.ts`。
+
+## 尚未完成 / 需原协作者重点关注
+
+- **完整 Playwright E2E 未收口**：最近一次全量 `19 passed / 20 failed (9.4m)`。其中约 15 个失败是
+  `browserContext.close: ENOENT ... test-results\.playwright-artifacts-N\traces\...` 的 **trace 产物基础设施问题**
+  （多进程争抢 `test-results/`），不是产品回归；用 `--workers=1` 单独复跑可隔离。真实断言失败目前只定位到两条：
+  `reference-home.spec.ts:37` 侧栏宽度 289 vs 期望 288（嫌疑：`Composer` 发送/停止按钮改为同一常驻元素后首页布局差 1px）、
+  `real-api.spec.ts:12` 告警文本不匹配。**明天第一件事见 `.cache/HANDOFF-NEXT.md`。**
+- **`test-results/performance-browser.json` 已生成**（30 次采样 + 1 次预热）：`clickToPreview` **p50=14ms / p95=17ms**（目标 ≤100ms）、
+  `oldMessageMutationsTotal=0`、`longTaskCount=0`、`welcomeOverlapSamples=0`；`clickToFirstDelta` p50≈1354ms（含 create+submit+上游连接+首次落库，**上游思考时间不计入本系统指标**）。
+  **未解决瓶颈**：`deltaInterval` p95≈1944ms，约 7% 的增量间隔约 1.8s，疑为 PostgreSQL 对持续增长的 TOAST `content` 列重写 + 写协程合并所致，需继续定位，**不得悄悄降标**。
+- Go 侧实测（远程库 RTT 75–90ms，非假存储）：SQL 往返/批 **旧 4 次 → 新 1 次**；四协议首段可见延迟 186–238ms
+  （旧实现 200ms ticker + 375ms 四语句 ≈ ≥560ms）；慢库背压 600 片段 → 20 次原子写、峰值并发写 = 1。
+- **sqlc 未安装**：以 `sql/queries.sql` 26 条命名查询与 `internal/db/queries.sql.go` 26 个生成方法一一对应、
+  且 `git diff --stat sql/ internal/db/ migrations/` 为空证明生成代码一致；本轮无字段新增，**未追加迁移**。
+- **`playwright.config.ts` 的 webServer 已改为 `node node_modules/vite/bin/vite.js ...`**：本机 pnpm shim 偶发联网等待会导致 60s webServer 超时，
+  改用等价 node 命令（AGENTS.md 许可）。
+- 硅基流动 `zai-org/GLM-5.3-Flash` 的参数映射已按智谱官方文档登记（强制思考、`low|high|max`、128K 输出、预算 128–32768），但**硅基流动是否上架该型号未经真实调用核实**；目录条目 `notes` 已明确"候选不代表账号已获权限，以账号自身 `/models` 返回为准"。
+- **Go `-race` 未运行**：本机无 gcc（`cgo: C compiler "gcc" not found`）。
+- 真实设备中文输入法与手机软键盘**仍未人工验收**（6.4 历史未勾选项继续有效，不以自动化代替）。
+- 真实供应商付费调用**仍未验证**；仿真上游结果与实网冒烟严格区分。
+- **换机继续入口：`.cache/HANDOFF-NEXT.md`**（含明天第一件事、环境坑、代码地图、未验收清单）。
+
+
 # 多供应商后端交付记录（2026-10-11）
 
 已完成用户批准的 Go 多用户后端与 Claude 风格设置页。当前变更为 `build-multi-provider-backend`（spec-driven），OpenSpec 实施进度 **17/17**。原 `build-chat-frontend` 保留 **32/33**，目标设备中文输入法和手机软键盘实机验收仍未完成。本轮没有 Git 提交、推送或归档，以下保留原前端阶段记录。

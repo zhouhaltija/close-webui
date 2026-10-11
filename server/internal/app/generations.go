@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"closewebui/server/internal/db"
@@ -15,6 +16,22 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+)
+
+// Streaming persistence coordination. The request loop never writes to the
+// database itself: it feeds a bounded queue and one writer goroutine owns every
+// write, so batches stay ordered and a slow database applies backpressure.
+const (
+	// streamMergeWindow coalesces adjacent upstream fragments into one atomic
+	// write. The first segment is flushed when the window elapses and is never
+	// held back waiting for a large batch threshold.
+	streamMergeWindow = 40 * time.Millisecond
+	// streamQueueItems bounds queued fragments and streamQueueBytes bounds the
+	// bytes in flight; the request loop blocks when either bound is reached.
+	streamQueueItems = 128
+	streamQueueBytes = 1 << 20
+	// streamBatchLimit bounds the writer's own merge buffer between writes.
+	streamBatchLimit = 256 << 10
 )
 
 type generationInput struct {
@@ -199,30 +216,30 @@ var errInactive = errors.New("generation is no longer active")
 func durableContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 10*time.Second)
 }
+
+// appendDelta persists one merged batch of visible text with a single atomic
+// statement instead of BEGIN + two UPDATEs + COMMIT. Both data-modifying CTEs
+// keep the original lock order (generations → messages) and every ownership and
+// activity predicate, and the statement is rejected as inactive unless it moves
+// exactly one active generation row and exactly one active assistant message.
 func (a *App) appendDelta(uid, cid, gid, assistantID, delta string) error {
 	ctx, cancel := durableContext()
 	defer cancel()
-	tx, err := a.pool.Begin(ctx)
+	var updated string
+	var messages int
+	err := a.pool.QueryRow(ctx, `WITH generation AS (
+		UPDATE generations SET status='streaming' WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND status IN ('pending','streaming') RETURNING id
+	), message AS (
+		UPDATE messages SET content=content || $4,status='streaming' WHERE id=$5 AND user_id=$2 AND conversation_id=$3 AND generation_id=$1 AND status IN ('pending','streaming') RETURNING id
+	)
+	SELECT COALESCE((SELECT id::text FROM generation),''),(SELECT count(*) FROM message)`, gid, uid, cid, delta, assistantID).Scan(&updated, &messages)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
-	var id string
-	err = tx.QueryRow(ctx, "UPDATE generations SET status='streaming' WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND status IN ('pending','streaming') RETURNING id", gid, uid, cid).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if updated == "" || messages != 1 {
 		return errInactive
 	}
-	if err != nil {
-		return err
-	}
-	result, err := tx.Exec(ctx, "UPDATE messages SET content=content || $1,status='streaming' WHERE id=$2 AND user_id=$3 AND conversation_id=$4 AND generation_id=$5 AND status IN ('pending','streaming')", delta, assistantID, uid, cid, gid)
-	if err != nil {
-		return err
-	}
-	if result.RowsAffected() != 1 {
-		return errInactive
-	}
-	return tx.Commit(ctx)
+	return nil
 }
 func (a *App) finish(uid, cid, gid, status string, problem *messageError, metadata json.RawMessage) (bool, error) {
 	ctx, cancel := durableContext()
@@ -328,7 +345,12 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 	if err = rc.Flush(); err != nil {
 		return
 	}
+	// Delta emission happens on the writer goroutine while heartbeats are written
+	// by this loop, so all response writes are serialized.
+	var writeMu sync.Mutex
 	emit := func(event any) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
 		_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
 		if e := json.NewEncoder(w).Encode(event); e != nil {
 			return e
@@ -350,28 +372,152 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 		}
 	}()
-	tick := time.NewTicker(200 * time.Millisecond)
-	defer tick.Stop()
+	queue := make(chan streamUpdate, streamQueueItems)
+	credits := make(chan int, streamQueueItems)
+	writeErr := make(chan error, 1)
+	writerExited := make(chan struct{})
+	go func() {
+		defer close(writerExited)
+		var batch []byte
+		var window <-chan time.Time
+		var timer *time.Timer
+		stopWindow := func() {
+			if timer != nil {
+				timer.Stop()
+				timer = nil
+			}
+			window = nil
+		}
+		fail := func(err error) {
+			select {
+			case writeErr <- err:
+			default:
+			}
+		}
+		// releaseCredit reports consumed bytes back to the request loop. The send
+		// is non-blocking so a loop that is no longer draining credits (for
+		// example while it finalizes) can never wedge the writer.
+		releaseCredit := func(n int) {
+			select {
+			case credits <- n:
+			default:
+			}
+		}
+		// flush persists the merged batch with one atomic statement and emits it
+		// only after the database confirmed the write.
+		flush := func() error {
+			if len(batch) == 0 {
+				return nil
+			}
+			text := string(batch)
+			batch = batch[:0]
+			if err := a.appendDelta(uid, cid, in.GenerationID, in.AssistantMessageID, text); err != nil {
+				return err
+			}
+			return emit(map[string]any{"type": "delta", "assistantMessageId": in.AssistantMessageID, "content": text})
+		}
+		for {
+			if len(batch) == 0 {
+				select {
+				case update, ok := <-queue:
+					if !ok {
+						return
+					}
+					releaseCredit(len(update.text))
+					batch = append(batch, update.text...)
+					timer = time.NewTimer(streamMergeWindow)
+					window = timer.C
+				}
+				continue
+			}
+			select {
+			case update, ok := <-queue:
+				if !ok {
+					if err := flush(); err != nil {
+						fail(err)
+					}
+					return
+				}
+				releaseCredit(len(update.text))
+				batch = append(batch, update.text...)
+				if len(batch) >= streamBatchLimit {
+					stopWindow()
+					if err := flush(); err != nil {
+						fail(err)
+						return
+					}
+				}
+			case <-window:
+				stopWindow()
+				if err := flush(); err != nil {
+					fail(err)
+					return
+				}
+			}
+		}
+	}()
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
-	var batch strings.Builder
-	size := 0
-	flush := func() error {
-		if batch.Len() == 0 {
+	var size, pendingBytes int
+	queueClosed := false
+	closeQueue := func() {
+		if !queueClosed {
+			queueClosed = true
+			close(queue)
+		}
+	}
+	writeFailure := func() error {
+		select {
+		case err := <-writeErr:
+			return err
+		default:
 			return nil
 		}
-		text := batch.String()
-		if e := a.appendDelta(uid, cid, in.GenerationID, in.AssistantMessageID, text); e != nil {
-			return e
+	}
+	// deliver hands one upstream fragment to the single writer. It blocks while
+	// the bounded queue is full, so a slow database back-pressures the upstream
+	// instead of queueing without limit or writing out of order.
+	deliver := func(text string) bool {
+		if len(text) <= streamQueueBytes {
+			for pendingBytes+len(text) > streamQueueBytes {
+				select {
+				case released := <-credits:
+					pendingBytes -= released
+				case <-writerExited:
+					return false
+				case <-ctx.Done():
+					return false
+				}
+			}
 		}
-		batch.Reset()
-		return emit(map[string]any{"type": "delta", "assistantMessageId": in.AssistantMessageID, "content": text})
+		pendingBytes += len(text)
+		for {
+			select {
+			case queue <- streamUpdate{text: text}:
+				return true
+			case released := <-credits:
+				pendingBytes -= released
+			case <-writerExited:
+				return false
+			case <-ctx.Done():
+				return false
+			}
+		}
+	}
+	// drainQueue stops the writer after every queued batch has been persisted and
+	// returns the first persistence failure, if any.
+	drainQueue := func() error {
+		closeQueue()
+		<-writerExited
+		return writeFailure()
+	}
+	saveFailure := func(err error) (string, error) {
+		if ctx.Err() != nil || errors.Is(err, errInactive) {
+			return "stopped", err
+		}
+		return "failed", errors.New("回答保存失败，请稍后重试。")
 	}
 	terminate := func(status string, e error, meta json.RawMessage) {
-		if flushErr := flush(); flushErr != nil && status == "completed" {
-			status = "failed"
-			e = flushErr
-		}
 		var problem *messageError
 		if status == "failed" {
 			problem = &messageError{Code: "UPSTREAM_FAILED", Message: "回答生成失败，请重试。"}
@@ -393,50 +539,66 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 			_ = emit(map[string]any{"type": "error", "assistantMessageId": in.AssistantMessageID, "code": problem.Code, "message": problem.Message})
 		}
 	}
+	// finalize drains every legal batch first, then persists the terminal state,
+	// and only then reports done/error. A failed save can never be reported as
+	// success.
+	finalize := func(status string, e error, meta json.RawMessage) {
+		if err := drainQueue(); err != nil {
+			status, e = saveFailure(err)
+		}
+		terminate(status, e, meta)
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			terminate("stopped", ctx.Err(), nil)
+			finalize("stopped", ctx.Err(), nil)
 			return
-		case <-tick.C:
-			if err = flush(); err != nil {
-				if ctx.Err() != nil || errors.Is(err, errInactive) {
-					terminate("stopped", err, nil)
-				} else {
-					terminate("failed", errors.New("回答保存失败，请稍后重试。"), nil)
-				}
-				return
-			}
 		case <-heartbeat.C:
+			writeMu.Lock()
 			_ = rc.SetWriteDeadline(time.Now().Add(15 * time.Second))
-			if _, err = fmt.Fprint(w, "\n"); err != nil {
+			_, err = fmt.Fprint(w, "\n")
+			flushErr := rc.Flush()
+			writeMu.Unlock()
+			if err != nil || flushErr != nil {
+				finalize("stopped", nil, nil)
 				return
 			}
-			if err = rc.Flush(); err != nil {
-				return
-			}
+		case err := <-writeErr:
+			status, e := saveFailure(err)
+			finalize(status, e, nil)
+			return
+		case released := <-credits:
+			// Keep the byte accounting current so the writer never has to wait for
+			// a credit slot.
+			pendingBytes -= released
 		case update := <-updates:
 			if update.terminal {
-				if ctx.Err() != nil {
-					terminate("stopped", ctx.Err(), nil)
-				} else if update.err != nil {
-					terminate("failed", update.err, update.metadata)
-				} else {
-					terminate("completed", nil, update.metadata)
+				var status string
+				var e error
+				switch {
+				case ctx.Err() != nil:
+					status, e = "stopped", ctx.Err()
+				case update.err != nil:
+					status, e = "failed", update.err
+				default:
+					status = "completed"
 				}
+				finalize(status, e, update.metadata)
 				return
 			}
 			size += len(update.text)
 			if size > 8<<20 {
-				terminate("failed", errors.New("回答超过大小限制。"), nil)
+				finalize("failed", errors.New("回答超过大小限制。"), nil)
 				return
 			}
-			batch.WriteString(update.text)
-			if batch.Len() >= 4096 {
-				if err = flush(); err != nil {
-					terminate("failed", errors.New("回答保存失败，请稍后重试。"), nil)
+			if !deliver(update.text) {
+				if err := writeFailure(); err != nil {
+					status, e := saveFailure(err)
+					finalize(status, e, nil)
 					return
 				}
+				finalize("stopped", ctx.Err(), nil)
+				return
 			}
 		}
 	}

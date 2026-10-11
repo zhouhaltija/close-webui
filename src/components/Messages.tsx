@@ -1,4 +1,4 @@
-import { Children, isValidElement, useEffect, useState, type ReactNode } from 'react';
+import { Children, isValidElement, memo, useEffect, useState, type ReactNode } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Check, Copy, RotateCcw } from 'lucide-react';
@@ -24,16 +24,22 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   }, [code, language]);
   return <div className="code-block"><div className="code-heading"><span>{language}</span><CopyButton text={code} label="复制代码" /></div>{highlighted?.code === code ? <div className="highlighted" dangerouslySetInnerHTML={{ __html: highlighted.html }} /> : <pre><code>{code}</code></pre>}</div>;
 }
-export function MessageView({ message, canRetry, onRetry }: { message: Message; canRetry: boolean; onRetry: () => void }) {
+function MessageBody({ message }: { message: Message }) {
+  const waiting = message.status === 'pending' ? message.phase === 'submitting' ? '正在提交…' : message.phase === 'awaiting' ? '等待模型响应…' : '正在整理思路' : '';
+  return <div className="markdown" data-phase={message.phase ?? ''} data-status={message.status}>
+    <Markdown remarkPlugins={[remarkGfm]} skipHtml components={{ pre: CodeBlock, table: ({ children }) => <div className="table-scroll"><table>{children}</table></div>, a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a> }}>{message.content}</Markdown>
+    {waiting && <span className="thinking" role="status">{waiting}<span>···</span></span>}
+    {message.status === 'streaming' && <span className="stream-cursor" aria-label="正在生成" />}
+  </div>;
+}
+/** Rendered once per unchanged message: only the streaming answer re-renders on a delta. */
+export const MessageView = memo(function MessageView({ message, canRetry, onRetry }: { message: Message; canRetry: boolean; onRetry: () => void }) {
   if (message.role === 'user') return <article className="user-message" data-testid="message-user"><div>{message.content}</div></article>;
   return <article className="assistant-message" data-testid="message-assistant" data-status={message.status}>
     <div className="assistant-heading"><Mark /><span>CloseWebUI</span></div>
-    <div className="markdown"><Markdown remarkPlugins={[remarkGfm]} skipHtml components={{ pre: CodeBlock, table: ({ children }) => <div className="table-scroll"><table>{children}</table></div>, a: ({ children, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer">{children}</a> }}>{message.content}</Markdown>
-      {message.status === 'pending' && <span className="thinking" role="status">正在整理思路<span>···</span></span>}
-      {message.status === 'streaming' && <span className="stream-cursor" aria-label="正在生成" />}
-    </div>
+    <MessageBody message={message} />
     {message.status === 'stopped' && <p className="message-status">已停止生成</p>}
     {message.status === 'failed' && <div className="message-error" role="alert">{message.error?.message || '回答中断了，请重试。'}{canRetry && <button onClick={onRetry}><RotateCcw size={14} />重试回答</button>}</div>}
     {message.content && !['pending', 'streaming'].includes(message.status) && <div className="message-actions"><CopyButton text={message.content} label="复制回答" /></div>}
   </article>;
-}
+}, (previous, next) => previous.message === next.message && previous.canRetry === next.canRetry);

@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -9,7 +9,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); useUI.setState({ dr
 function mount(path = '/') {
   vi.stubEnv('VITE_ENABLE_MOCK', 'false');
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes><Route path="/" element={<App />} /><Route path="/chat/:conversationId" element={<App />} /><Route path="/settings/:section" element={<App />} /></Routes></MemoryRouter></QueryClientProvider>);
+  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes><Route path="/" element={<App />} /><Route path="/chat/:conversationId" element={<App />} /><Route path="/settings/:section" element={<App />} /><Route path="/settings/providers/:providerId" element={<App />} /></Routes></MemoryRouter></QueryClientProvider>);
   return client;
 }
 it('requires login before querying private history and clears drafts on expiration', async () => {
@@ -35,9 +35,9 @@ it('disables sending without a real model and provides settings navigation', asy
 it('saves a provider without replacing its retained key when the key field is blank', async () => {
   let saved: unknown;
   const provider = { id: 'p1', name: '测试供应商', templateId: 'custom', protocol: 'openai-chat', adapter: 'standard', baseUrl: 'https://example.com/v1', enabled: true, hasKey: true };
-  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { if (url.endsWith('/auth/me')) return Response.json({ id: 'u1', username: 'demo_user' }); if (init.method === 'PATCH') { saved = JSON.parse(init.body as string); return Response.json(provider); } if (url.endsWith('/providers')) return Response.json([provider]); return Response.json([]); });
-  mount('/settings/providers');
-  fireEvent.click(await screen.findByRole('button', { name: '编辑测试供应商' }));
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { if (url.endsWith('/auth/me')) return Response.json({ id: 'u1', username: 'demo_user' }); if (url === '/api/providers/p1' && init.method === 'PATCH') { saved = JSON.parse(init.body as string); return Response.json(provider); } if (url.endsWith('/providers')) return Response.json([provider]); return Response.json([]); });
+  mount('/settings/providers/p1');
+  expect(await screen.findByRole('heading', { name: '测试供应商' })).toBeVisible();
   expect(screen.getByLabelText('API 密钥')).toHaveValue('');
   fireEvent.click(screen.getByRole('button', { name: '保存供应商' }));
   await waitFor(() => expect(saved).toMatchObject({ name: '测试供应商', baseUrl: 'https://example.com/v1' }));
@@ -80,10 +80,13 @@ it('retries a saved failed response with its original model even if another mode
 it('allows an explicit replacement when the saved default model is unavailable', async () => {
   const model = { id: 'm2', providerId: 'p1', modelId: 'unknown-model', name: '可用模型', enabled: true, maxOutputTokens: 4096, defaultReasoning: {}, capabilities: { family: '', efforts: [], supportsToggle: false, mandatory: false, budgetMin: 0, budgetMax: 0, budgetSupported: false, outputMax: 4096, sources: [], known: false } };
   vi.stubGlobal('fetch', async (url: string) => Response.json(url.endsWith('/auth/me') ? { id: 'u1', username: 'demo_user' } : url.endsWith('/preferences') ? { defaultModelId: 'deleted-model' } : url.endsWith('/models') ? [model] : url.endsWith('/providers') ? [{ id: 'p1', name: '测试供应商', enabled: true }] : []));
-  mount(); fireEvent.click(await screen.findByRole('button', { name: '选择真实模型' }));
-  fireEvent.click(screen.getByRole('button', { name: /可用模型/ }));
+  mount();
+  const trigger = await screen.findByRole('button', { name: '选择真实模型' });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.click(screen.getByRole('menuitemradio', { name: /可用模型/ }));
   expect(useUI.getState().realModelId).toBe('m2');
   expect(screen.queryByLabelText('思考档位')).not.toBeInTheDocument();
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
 });
 
 it('logs out and keeps the next user free of the previous user’s drafts, queries and model choices', async () => {
@@ -101,26 +104,33 @@ it('logs out and keeps the next user free of the previous user’s drafts, queri
 it('keeps manual model creation available after discovery fails', async () => {
   let saved: unknown;
   const provider = { id: 'p1', name: '测试供应商', templateId: 'custom', protocol: 'openai-chat', adapter: 'standard', baseUrl: 'https://example.com/v1', enabled: true, hasKey: true };
-  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { if (url.endsWith('/auth/me')) return Response.json({ id: 'u1', username: 'demo_user' }); if (url.endsWith('/providers')) return Response.json([provider]); if (url.endsWith('/preferences')) return Response.json({ defaultModelId: null }); if (url.endsWith('/discover')) return Response.json({ error: { code: 'DISCOVERY_FAILED', message: '供应商不支持模型发现，请手动添加。' } }, { status: 502 }); if (url.endsWith('/models') && init.method === 'POST') { saved = JSON.parse(init.body as string); return Response.json({ id: 'm1' }); } return Response.json([]); });
-  mount('/settings/models'); fireEvent.change(await screen.findByLabelText('发现模型的供应商'), { target: { value: 'p1' } }); fireEvent.click(screen.getByRole('button', { name: '发现模型' }));
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => { if (url.endsWith('/auth/me')) return Response.json({ id: 'u1', username: 'demo_user' }); if (url.endsWith('/providers')) return Response.json([provider]); if (url.endsWith('/preferences')) return Response.json({ defaultModelId: null }); if (url.endsWith('/model-candidates')) return Response.json({ error: { code: 'DISCOVERY_FAILED', message: '供应商不支持模型发现，请手动添加。' } }, { status: 502 }); if (url.endsWith('/models') && init.method === 'POST') { saved = JSON.parse(init.body as string); return Response.json({ id: 'm1' }); } return Response.json([]); });
+  mount('/settings/providers/p1'); fireEvent.click(await screen.findByRole('button', { name: '拉取模型' }));
   expect(await screen.findByRole('alert')).toHaveTextContent('供应商不支持模型发现');
-  fireEvent.click(screen.getByRole('button', { name: '手动添加' })); fireEvent.change(screen.getByLabelText('模型 ID'), { target: { value: 'custom-model' } }); fireEvent.change(screen.getByLabelText('显示名称'), { target: { value: '手动模型' } }); fireEvent.click(screen.getByRole('button', { name: '保存模型' }));
+  fireEvent.click(screen.getByRole('button', { name: '手动添加模型' })); fireEvent.change(screen.getByLabelText('模型 ID'), { target: { value: 'custom-model' } }); fireEvent.change(screen.getByLabelText('显示名称'), { target: { value: '手动模型' } }); fireEvent.click(screen.getByRole('button', { name: '添加模型' }));
   await waitFor(() => expect(saved).toMatchObject({ providerId: 'p1', modelId: 'custom-model', name: '手动模型', defaultReasoning: {}, maxOutputTokens: 4096 }));
 });
 
 it('validates native budgets before sending and never offers a mandatory reasoning off switch', async () => {
   const model = { id: 'm1', providerId: 'p1', modelId: 'verified-model', name: '预算模型', enabled: true, maxOutputTokens: 4096, defaultReasoning: {}, capabilities: { family: 'Claude', budgetWithinOutput: true, efforts: [], supportsToggle: false, mandatory: true, budgetMin: 1024, budgetMax: 8192, budgetSupported: true, outputMax: 8192, sources: [], known: true } };
   vi.stubGlobal('fetch', async (url: string) => Response.json(url.endsWith('/auth/me') ? { id: 'u1', username: 'demo_user' } : url.endsWith('/models') ? [model] : url.endsWith('/providers') ? [{ id: 'p1', enabled: true }] : url.endsWith('/preferences') ? { defaultModelId: 'm1' } : []));
-  mount(); fireEvent.click(await screen.findByRole('button', { name: '选择真实模型：预算模型' })); expect(screen.queryByLabelText('思考开关')).not.toBeInTheDocument();
-  fireEvent.change(screen.getByLabelText(/思考预算/), { target: { value: '4096' } }); expect(within(screen.getByRole('dialog')).getByRole('alert')).toHaveTextContent('小于输出上限'); fireEvent.click(screen.getByRole('button', { name: '完成' })); fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '问题' } });
+  mount();
+  const trigger = await screen.findByRole('button', { name: '选择真实模型：预算模型' });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  expect(screen.queryByLabelText('思考开关')).not.toBeInTheDocument();
+  fireEvent.click(screen.getByText('思考设置'));
+  fireEvent.change(screen.getByLabelText(/思考预算/), { target: { value: '4096' } });
+  expect(screen.getByRole('alert')).toHaveTextContent('小于输出上限');
+  fireEvent.keyDown(document, { key: 'Escape' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '问题' } });
   expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled(); expect(screen.getByRole('alert')).toHaveTextContent('小于输出上限');
 });
 
 it('ignores a delayed stop error belonging to the user who already signed out', async () => {
-  let resolveStop!: (response: Response) => void; const now = '2026-10-11T00:00:00Z';
+  let resolveStop!: (response: Response) => void; let signedOut = false; const now = '2026-10-11T00:00:00Z';
   const model = { id: 'm1', providerId: 'p1', modelId: 'plain', name: '普通模型', enabled: true, maxOutputTokens: 4096, defaultReasoning: {}, capabilities: { family: '', efforts: [], supportsToggle: false, mandatory: false, budgetMin: 0, budgetMax: 0, budgetSupported: false, outputMax: 4096, sources: [], known: false } };
   vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
-    if (url.endsWith('/auth/me')) return Response.json({ id: 'u1', username: 'test_one' });
+    if (url.endsWith('/auth/me')) return signedOut ? Response.json({ error: { code: 'UNAUTHORIZED', message: '请登录。' } }, { status: 401 }) : Response.json({ id: 'u1', username: 'test_one' });
     if (url.endsWith('/auth/login')) return Response.json({ id: 'u2', username: 'test_two' });
     if (url.endsWith('/models')) return Response.json([model]); if (url.endsWith('/providers')) return Response.json([{ id: 'p1', enabled: true }]); if (url.endsWith('/preferences')) return Response.json({ defaultModelId: 'm1' });
     if (url.endsWith('/stop')) return new Promise<Response>(resolve => { resolveStop = resolve; });
@@ -130,7 +140,7 @@ it('ignores a delayed stop error belonging to the user who already signed out', 
   });
   mount(); await screen.findByRole('button', { name: '选择真实模型：普通模型' }); fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
   await screen.findByRole('button', { name: '停止生成' }); await waitFor(() => expect(useUI.getState().drafts.home).toBe(''));
-  act(() => window.dispatchEvent(new Event('closewebui:unauthorized'))); await screen.findByRole('heading', { name: '登录 CloseWebUI' });
+  act(() => { signedOut = true; window.dispatchEvent(new Event('closewebui:unauthorized')); }); await screen.findByRole('heading', { name: '登录 CloseWebUI' });
   fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'test_two' } }); fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'synthetic-password' } }); fireEvent.click(screen.getByRole('button', { name: '登录' })); await screen.findByRole('button', { name: '账户菜单：test_two' });
   await act(async () => { resolveStop(Response.json({ error: { code: 'STOP_FAILED', message: '旧账号的停止失败。' } }, { status: 500 })); });
   expect(useUI.getState().error).toBe('');
@@ -161,10 +171,11 @@ it('returns to login after a newly registered account signs out', async () => {
   expect(await screen.findByRole('heading', { name: '登录 CloseWebUI' })).toBeVisible();
 });
 
-it('restores keyboard focus to the provider editor trigger after Escape', async () => {
-  vi.stubGlobal('fetch', async (url: string) => Response.json(url.endsWith('/auth/me') ? { id: 'u1', username: 'test_user' } : []));
-  mount('/settings/providers'); const trigger = await screen.findByRole('button', { name: '添加供应商' });
-  trigger.focus(); fireEvent.click(trigger); const dialog = screen.getByRole('dialog', { name: '添加供应商' });
+it('restores keyboard focus to the model editor trigger after Escape', async () => {
+  const provider = { id: 'p1', name: '测试供应商', templateId: 'custom', protocol: 'openai-chat', adapter: 'standard', baseUrl: 'https://example.com/v1', enabled: true, hasKey: true };
+  vi.stubGlobal('fetch', async (url: string) => Response.json(url.endsWith('/auth/me') ? { id: 'u1', username: 'test_user' } : url.endsWith('/providers') ? [provider] : []));
+  mount('/settings/providers'); const trigger = await screen.findByRole('button', { name: '手动添加模型' });
+  trigger.focus(); fireEvent.click(trigger); const dialog = screen.getByRole('dialog', { name: '手动添加模型' });
   fireEvent.keyDown(dialog, { key: 'Escape' }); await waitFor(() => expect(trigger).toHaveFocus());
 });
 
@@ -180,17 +191,16 @@ it('allows explicitly resetting stale native defaults before saving an unknown m
     if (url.endsWith('/models')) return Response.json([model]);
     return Response.json([]);
   });
-  mount('/settings/models'); fireEvent.click(await screen.findByRole('button', { name: '编辑模型能力变更模型' }));
-  const dialog = within(screen.getByRole('dialog', { name: '编辑模型' }));
-  expect(dialog.getByRole('alert')).toHaveTextContent('尚未核实思考能力');
-  expect(dialog.getByRole('button', { name: '保存模型' })).toBeDisabled();
+  mount('/settings/providers/p1'); fireEvent.click(await screen.findByRole('button', { name: '编辑能力变更模型的思考参数' }));
+  expect(screen.getByRole('alert')).toHaveTextContent('尚未核实思考能力');
+  expect(screen.getByRole('button', { name: '保存参数' })).toBeDisabled();
   expect(saved).toBeUndefined();
-  fireEvent.click(dialog.getByRole('button', { name: '重置为供应商默认' }));
-  expect(dialog.queryByRole('alert')).not.toBeInTheDocument();
-  expect(dialog.getByRole('button', { name: '保存模型' })).toBeEnabled();
+  fireEvent.click(screen.getByRole('button', { name: '重置为供应商默认' }));
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '保存参数' })).toBeEnabled();
   expect(model.defaultReasoning).toEqual({ enabled: true, effort: 'high', budgetTokens: 2048 });
   expect(saved).toBeUndefined();
-  fireEvent.click(dialog.getByRole('button', { name: '保存模型' }));
+  fireEvent.click(screen.getByRole('button', { name: '保存参数' }));
   await waitFor(() => expect(saved).toMatchObject({ defaultReasoning: {}, maxOutputTokens: 4096 }));
 });
 
@@ -200,9 +210,10 @@ it.each([1, 2])('requires explicit model choice with a null saved default and %s
   mount(); await screen.findByRole('button', { name: '账户菜单：test_user' });
   fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '问题' } });
   expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
-  fireEvent.click(await screen.findByRole('button', { name: '选择真实模型' }));
-  fireEvent.click(screen.getByRole('button', { name: /可用模型1/ }));
-  fireEvent.click(screen.getByRole('button', { name: '完成' }));
+  const trigger = screen.getByRole('button', { name: '选择真实模型' });
+  fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
+  fireEvent.click(screen.getByRole('menuitemradio', { name: /可用模型1/ }));
   expect(screen.getByRole('button', { name: '选择真实模型：可用模型1' })).toBeVisible();
   expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+  expect(useUI.getState().drafts.home).toBe('问题');
 });

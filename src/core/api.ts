@@ -1,5 +1,5 @@
 import { ApiError } from './errors';
-import type { Conversation, ConversationSummary, GenerationInput, User, ProviderTemplate, Provider, ProviderInput, Model, ModelInput, Preferences } from './types';
+import type { Conversation, ConversationSummary, GenerationInput, User, ProviderTemplate, Provider, ProviderInput, Model, ModelInput, Preferences, ModelCatalog, ModelCandidates, ModelBatchEntry, ModelBatchResponse } from './types';
 export interface ChatApi {
   list(): Promise<ConversationSummary[]>;
   get(id: string): Promise<Conversation>;
@@ -56,6 +56,9 @@ export const accountApi = {
   saveProvider: (value: ProviderInput, id?: string) => write(id ? `/providers/${encodeURIComponent(id)}` : '/providers', value, id ? 'PATCH' : 'POST').then(json<Provider>),
   removeProvider: async (id: string) => { await request(`/providers/${encodeURIComponent(id)}`, { method: 'DELETE' }); },
   discover: (id: string) => request(`/providers/${encodeURIComponent(id)}/discover`, { method: 'POST' }).then(json<{ id: string; name: string }[]>),
+  catalog: (id: string) => request(`/providers/${encodeURIComponent(id)}/model-catalog`).then(json<ModelCatalog>),
+  candidates: (id: string) => request(`/providers/${encodeURIComponent(id)}/model-candidates`, { method: 'POST' }).then(json<ModelCandidates>),
+  batchModels: (id: string, models: ModelBatchEntry[]) => write(`/providers/${encodeURIComponent(id)}/models/batch`, { models }).then(json<ModelBatchResponse>),
   models: () => request('/models').then(json<Model[]>),
   saveModel: (value: ModelInput, id?: string) => write(id ? `/models/${encodeURIComponent(id)}` : '/models', value, id ? 'PATCH' : 'POST').then(json<Model>),
   removeModel: async (id: string) => { await request(`/models/${encodeURIComponent(id)}`, { method: 'DELETE' }); },

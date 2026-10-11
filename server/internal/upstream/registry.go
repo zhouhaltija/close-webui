@@ -107,6 +107,16 @@ func buildRegistry() map[registryKey]profile {
 	add("siliconflow", "openai-chat", "deepseek", siliconSource, "mandatory", []string{"deepseek-ai/DeepSeek-R1"}, nil, false, true, 0, 0, 32768)
 	add("siliconflow", "openai-chat", "deepseek", siliconSource, "enable", []string{"Pro/deepseek-ai/DeepSeek-V4", "deepseek-ai/DeepSeek-V4-Flash"}, []string{"high", "max"}, true, false, 128, 32768, 32768)
 	add("siliconflow", "openai-chat", "glm", siliconSource, "enable", []string{"Pro/zai-org/GLM-5.2"}, []string{"high", "max"}, true, false, 128, 32768, 32768)
+	// GLM-5.3 Flash is only listed under its exact SiliconFlow namespace. The
+	// thinking parameters come from the Zhipu model page, so both sources are
+	// recorded; thinking cannot be turned off on this model.
+	add("siliconflow", "openai-chat", "glm", siliconSource, "enable", []string{"zai-org/GLM-5.3-Flash"}, []string{"low", "high", "max"}, false, true, 128, 32768, 128000)
+	for _, id := range []string{"zai-org/GLM-5.3-Flash"} {
+		k := registryKey{"siliconflow", "openai-chat", id}
+		p := r[k]
+		p.capability.Sources = append(p.capability.Sources, "https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash")
+		r[k] = p
+	}
 	for _, id := range []string{"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1"} {
 		k := registryKey{"standard", "anthropic", id}
 		p := r[k]

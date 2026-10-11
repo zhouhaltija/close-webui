@@ -21,33 +21,28 @@ async function configure(page: Page) {
   expect(response.ok()).toBe(true);
   const upstream = await response.json() as { url: string };
   await page.goto('/settings/providers');
-  await page.getByRole('button', { name: '添加供应商' }).click();
-  const providerDialog = page.getByRole('dialog', { name: '添加供应商' });
-  await expect(providerDialog).toBeVisible({ timeout: 5000 });
-  await providerDialog.getByRole('combobox', { name: '模板', exact: true }).selectOption('custom', { timeout: 5000 });
-  await providerDialog.getByLabel('名称', { exact: true }).fill('本地测试供应商');
-  await providerDialog.getByRole('combobox', { name: '接口协议', exact: true }).selectOption('openai-chat');
-  await providerDialog.getByLabel('接口地址', { exact: true }).fill(upstream.url);
-  await providerDialog.getByLabel('API 密钥', { exact: true }).fill('synthetic-key');
-  await providerDialog.getByRole('button', { name: '保存供应商' }).click();
-  await expect(providerDialog).not.toBeVisible();
-  await expect(page.getByText('密钥已配置', { exact: true })).toBeVisible();
-  await page.getByRole('navigation', { name: '设置分类' }).getByRole('link', { name: '模型', exact: true }).click();
-  await page.getByLabel('发现模型的供应商', { exact: true }).selectOption({ label: '本地测试供应商' });
-  await page.getByRole('button', { name: '发现模型', exact: true }).click();
-  await page.locator('.candidate').filter({ hasText: 'gpt-5.1' }).click();
-  const modelDialog = page.getByRole('dialog', { name: '添加模型' });
-  await expect(modelDialog.getByLabel('模型 ID', { exact: true })).toHaveValue('gpt-5.1');
-  await modelDialog.getByLabel('显示名称', { exact: true }).fill('GPT 5.1 测试');
-  await modelDialog.getByRole('button', { name: '保存模型' }).click();
-  await expect(modelDialog).not.toBeVisible();
-  await page.getByRole('button', { name: '编辑模型GPT 5.1 测试', exact: true }).click();
-  const editDialog = page.getByRole('dialog', { name: '编辑模型' });
-  await editDialog.getByRole('combobox', { name: '思考档位', exact: true }).selectOption('medium');
-  await editDialog.getByRole('button', { name: '保存模型' }).click();
-  await expect(editDialog).not.toBeVisible();
-  await page.getByRole('button', { name: '设为默认', exact: true }).click();
-  await expect(page.getByText('默认模型', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '添加供应商', exact: true }).click();
+  const detail = page.locator('.provider-detail');
+  await expect(detail.getByRole('heading', { name: '添加供应商' })).toBeVisible();
+  await detail.getByLabel('名称', { exact: true }).fill('本地测试供应商');
+  await detail.getByLabel('接口地址', { exact: true }).fill(upstream.url);
+  await detail.getByLabel('API 密钥', { exact: true }).fill('synthetic-key');
+  await detail.getByRole('button', { name: '保存供应商' }).click();
+  // Saving a provider for the first time pulls its models once.
+  await expect(page.getByText('上游返回', { exact: true })).toBeVisible({ timeout: 20000 });
+  const candidate = page.locator('.candidate').filter({ hasText: 'gpt-5.1' });
+  await expect(candidate).toBeVisible({ timeout: 20000 });
+  await candidate.locator('input[type="checkbox"]').check();
+  await page.getByRole('button', { name: '批量添加', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: '批量添加完成' })).toBeVisible({ timeout: 20000 });
+  const row = page.locator('.model-row').filter({ hasText: 'gpt-5.1' });
+  await expect(row).toBeVisible();
+  await row.getByRole('button', { name: '思考参数' }).click();
+  await row.getByLabel('思考档位', { exact: true }).selectOption('medium');
+  await row.getByRole('button', { name: '保存参数' }).click();
+  await expect(page.getByRole('status').filter({ hasText: '原生思考参数' })).toBeVisible({ timeout: 20000 });
+  await row.getByRole('button', { name: /设为默认/ }).click();
+  await expect(row.getByText('默认模型', { exact: true })).toBeVisible();
 }
 
 async function send(page: Page, content: string) {
@@ -65,7 +60,7 @@ test('real Go registers, configures native reasoning, persists chat, retries, st
   await expect(page.getByRole('button', { name: '发送消息', exact: true })).toBeDisabled();
   await configure(page);
   await page.getByRole('link', { name: '返回聊天', exact: true }).click();
-  await expect(page.getByRole('button', { name: '选择真实模型：GPT 5.1 测试', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /选择真实模型/ })).toBeVisible();
   const content = `保存我的测试对话 ${randomUUID().slice(0, 8)}`;
   await send(page, content);
   await expect(page.getByTestId('message-assistant')).toHaveAttribute('data-status', 'completed');
@@ -119,14 +114,17 @@ for (const width of [1440, 1024, 390]) {
       await expect(page.getByRole('navigation', { name: '设置分类' })).toBeVisible();
       const main = page.getByRole('main'); await expect(main.getByRole('heading', { level: 1 })).toBeVisible();
       if (section === 'providers') await expect(main.getByRole('heading', { name: '本地测试供应商', exact: true })).toBeVisible();
-      if (section === 'models') await expect(main.getByRole('heading', { name: 'GPT 5.1 测试', exact: true })).toBeVisible();
+      if (section === 'models') await expect(main.locator('.model-row').filter({ hasText: 'gpt-5.1' })).toBeVisible();
       if (section === 'account') await expect(main.getByLabel('确认新密码', { exact: true })).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       await page.screenshot({ path: `test-results/screenshots/backend-settings-${section}-${width}.png`, fullPage: true });
       if (section === 'providers') {
-        const trigger = page.getByRole('button', { name: '添加供应商', exact: true });
+        // The provider workspace is inline, so the constrained layer under test is the
+        // manual model dialog: Tab stays inside it and Escape restores focus to its trigger.
+        const trigger = page.getByRole('button', { name: '手动添加模型', exact: true });
         await trigger.focus(); await page.keyboard.press('Enter');
-        await expect(page.getByRole('dialog', { name: '添加供应商' })).toBeVisible();
+        const dialog = page.getByRole('dialog', { name: '手动添加模型' });
+        await expect(dialog).toBeVisible();
         await page.keyboard.press('Tab');
         expect(await page.evaluate(() => !!document.activeElement?.closest('[role="dialog"]'))).toBe(true);
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);

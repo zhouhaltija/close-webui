@@ -13,7 +13,9 @@ export function Composer({ value, onChange, onSend, onStop, busy, disabled, send
     <div className="composer-toolbar">
       <div className="composer-right">
         {modelSelector ?? <ModelSelector />}
-        {busy ? <button type="button" className="send-button" aria-label="停止生成" title="停止生成" onClick={onStop}><Square size={15} fill="currentColor" /></button> : value.trim() && <button type="submit" className="send-button" aria-label="发送消息" title="发送消息" disabled={!canSend}><ArrowUp size={18} strokeWidth={1.8} /></button>}
+        {/* One stable button element: swapping two buttons at the same coordinates would
+            let a single click both stop a generation and submit a new message. */}
+        <button type={busy ? 'button' : 'submit'} className="send-button" aria-label={busy ? '停止生成' : '发送消息'} title={busy ? '停止生成' : '发送消息'} onClick={busy ? onStop : undefined} disabled={!busy && !canSend}>{busy ? <Square size={15} fill="currentColor" /> : <ArrowUp size={18} strokeWidth={1.8} />}</button>
       </div>
     </div>
   </form>;
