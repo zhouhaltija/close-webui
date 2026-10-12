@@ -118,6 +118,7 @@ export class GenerationCoordinator {
         let settled = false;
         try {
           const fresh = await this.deps.api.get(active.id);
+          if (!current()) return false;
           const user = fresh.messages.find(m => m.id === active.input.userMessageId);
           const assistant = fresh.messages.find(m => m.id === active.input.assistantMessageId);
           if (user && assistant) {
@@ -125,24 +126,27 @@ export class GenerationCoordinator {
             if (assistant.status === 'failed') this.deps.terminate?.(active.id!, assistant.id, 'failed', assistant.error);
           }
         } catch { /* Reconciliation is best effort; fall through to the local failure. */ }
+        if (!current()) return false;
         if (settled) { flushFrames(); hidePreview(); }
         else {
           if (active.preview) { active.preview = active.preview.map(m => m.id === active.input.assistantMessageId ? { ...m, status: 'failed', error: { code: 'SUBMIT_FAILED', message } } : m); showPreview(); }
           this.deps.error(message);
         }
       } else {
-        if (active.preview) { active.preview = active.preview.map(m => m.id === active.input.assistantMessageId ? { ...m, status: 'failed', error: { code: 'SUBMIT_FAILED', message } } : m); showPreview(); }
+        // Creation failed before any server conversation or message was accepted.
+        // Keep the composer draft, but remove temporary messages and their retry UI.
+        hidePreview();
         this.deps.error(message);
       }
       return false;
     } finally {
-      cancelTick(this.handle); this.handle = undefined;
-      if (this.active === active) { this.active = undefined; this.deps.busy(false); }
+      if (this.active === active) { cancelTick(this.handle); this.handle = undefined; this.active = undefined; this.deps.busy(false); }
     }
   }
   stop() {
     const active = this.active; if (!active) return;
     this.active = undefined; active.controller.abort();
+    cancelTick(this.handle); this.handle = undefined;
     if (active.id && active.input.generationId) void this.deps.api.stop?.(active.id, active.input.generationId).catch(error => this.deps.error(errorText(error)));
     const snapshot = active.id ? this.deps.terminate?.(active.id, active.input.assistantMessageId, 'stopped') : undefined;
     if (snapshot) this.deps.publish(snapshot);

@@ -34,7 +34,7 @@ func main() {
 		os.Exit(1)
 	}
 }
-func run() error {
+func run() (runErr error) {
 	address := flag.String("listen", "127.0.0.1:4175", "test HTTP address")
 	static := flag.String("static", "../.test-dist/backend", "test frontend")
 	flag.Parse()
@@ -55,16 +55,24 @@ func run() error {
 		return fmt.Errorf("cannot create isolated test schema")
 	}
 	var cleanupOnce sync.Once
+	var cleanupErr error
 	cleaned := make(chan struct{})
-	cleanupSchema := func() {
+	cleanupSchema := func() error {
 		cleanupOnce.Do(func() {
 			cleanup, done := context.WithTimeout(context.Background(), 15*time.Second)
 			defer done()
-			_, _ = admin.Exec(cleanup, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+			if _, err := admin.Exec(cleanup, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+				cleanupErr = fmt.Errorf("isolated test schema cleanup failed")
+			}
 			close(cleaned)
 		})
+		return cleanupErr
 	}
-	defer cleanupSchema()
+	defer func() {
+		if err := cleanupSchema(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
 	u, err := url.Parse(dsn)
 	if err != nil {
 		return fmt.Errorf("invalid test database configuration")
@@ -193,13 +201,17 @@ func run() error {
 		}
 		shutdownOnce.Do(cancel)
 		<-cleaned
+		if cleanupErr != nil {
+			http.Error(w, "isolated test schema cleanup failed", http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(204)
 	})
 	server := &http.Server{Addr: *address, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()
 		service.Close()
-		cleanupSchema()
+		_ = cleanupSchema()
 		closeCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
 		defer done()
 		_ = server.Shutdown(closeCtx)

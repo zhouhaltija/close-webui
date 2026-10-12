@@ -1,5 +1,31 @@
 import { expect, test, type Route } from '@playwright/test';
 
+for (const width of [1440, 1024, 390]) {
+  test(`login and registration keep a readable centered form at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+    await page.route(/\/(?:api|integration-api)\/auth\/me$/, route => route.fulfill({ status: 401, json: { error: { code: 'UNAUTHORIZED', message: '请先登录。' } } }));
+    await page.goto('/');
+    for (const registration of [false, true]) {
+      if (registration) await page.getByRole('button', { name: '没有账号？注册' }).click();
+      await expect(page.getByRole('heading', { name: registration ? '创建 CloseWebUI 账号' : '登录 CloseWebUI' })).toBeVisible();
+      const form = page.locator('.auth-card');
+      const box = (await form.boundingBox())!;
+      expect(box.width).toBeLessThanOrEqual(420);
+      expect(box.width).toBeGreaterThanOrEqual(300);
+      expect(Math.abs(box.x + box.width / 2 - width / 2)).toBeLessThanOrEqual(1);
+      for (const name of ['用户名', '密码']) {
+        const input = page.getByLabel(name, { exact: true });
+        await expect(input).toBeVisible();
+        const inputBox = (await input.boundingBox())!;
+        expect(inputBox.height).toBeGreaterThanOrEqual(40);
+        expect(inputBox.width).toBeGreaterThanOrEqual(300);
+        expect(await input.evaluate(el => getComputedStyle(el).borderTopWidth)).toBe('1px');
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    }
+  });
+}
+
 async function identityAndModels(route: Route) {
   const path = new URL(route.request().url()).pathname;
   if (path.endsWith('/auth/me')) { await route.fulfill({ json: { id: 'synthetic-user', username: 'synthetic_user' } }); return true; }

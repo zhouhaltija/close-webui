@@ -41,8 +41,12 @@ func fixture(t *testing.T, upstreamURL string) (*httptest.Server, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = admin.Exec(ctx, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
-		_ = admin.Close(ctx)
+		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := admin.Exec(cleanup, "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE"); err != nil {
+			t.Error("isolated test schema cleanup failed:", err)
+		}
+		_ = admin.Close(cleanup)
 	})
 	parsed, err := pgx.ParseConfig(dsn)
 	if err != nil {
@@ -61,6 +65,9 @@ func fixture(t *testing.T, upstreamURL string) (*httptest.Server, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Register disposal before Up: a migration error calls Fatal, which must still
+	// release its SQL connections before the schema cleanup runs.
+	t.Cleanup(func() { _ = std.Close() })
 	if err = migrations.Up(ctx, std); err != nil {
 		t.Fatal(err)
 	}

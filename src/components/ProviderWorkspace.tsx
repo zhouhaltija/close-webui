@@ -1,10 +1,10 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useMutation, useMutationState, useQuery, useQueryClient } from '@tanstack/react-query';
 import * as AlertDialog from '@radix-ui/react-alert-dialog';
 import * as Dialog from '@radix-ui/react-dialog';
 import { Plus, Search, X } from 'lucide-react';
-import { accountApi } from '../core/api';
+import { accountApi, sessionRequestRevision } from '../core/api';
 import { errorText } from '../core/errors';
 import type { Adapter, CatalogEntry, Model, ModelBatchEntry, ModelBatchResult, Protocol, Provider, ProviderInput, Reasoning } from '../core/types';
 import { ReasoningFields, reasoningError } from './ReasoningFields';
@@ -67,7 +67,9 @@ function ProviderDetail({ provider, isNew, drafts, guard, onCreated, onCancelNew
   const models = useQuery({ queryKey: ['models'], queryFn: accountApi.models });
   const preferences = useQuery({ queryKey: ['preferences'], queryFn: accountApi.preferences });
   const templates = useQuery({ queryKey: ['provider-templates'], queryFn: accountApi.templates });
-  const [form, setForm] = useState<ProviderForm>(() => (isNew || !provider ? { ...blankForm } : drafts.current.get(provider.id) ?? formFrom(provider)));
+  const [form, setForm] = useState<ProviderForm>(() => drafts.current.get(isNew ? 'new' : provider?.id || '') ?? (provider ? formFrom(provider) : { ...blankForm }));
+  const active = useRef(true);
+  useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
   const [filter, setFilter] = useState('');
   const [picked, setPicked] = useState<string[]>([]);
   const [editing, setEditing] = useState<string | null>(null);
@@ -115,11 +117,24 @@ function ProviderDetail({ provider, isNew, drafts, guard, onCreated, onCancelNew
     })();
   };
   const pull = () => { if (!provider) return; void client.fetchQuery({ queryKey: candidateKey(provider), queryFn: () => fetchCandidates(provider), staleTime: 0 }).catch(() => {}); };
-  const toggleModel = async (model: Model, enabled: boolean) => {
-    const previous = client.getQueryData<Model[]>(['models']);
+  const toggleKey = ['model-toggle', sessionRequestRevision()] as const;
+  const pendingToggles = useMutationState({ filters: { mutationKey: toggleKey, status: 'pending' }, select: mutation => (mutation.state.variables as { model: Model }).model.id });
+  const toggle = useMutation({ mutationKey: toggleKey, mutationFn: async ({ model, enabled, revision }: { model: Model; enabled: boolean; revision: number }) => {
+    if (revision !== sessionRequestRevision()) return;
+    const previous = client.getQueryData<Model[]>(['models'])?.find(item => item.id === model.id);
     client.setQueryData<Model[]>(['models'], current => current?.map(item => item.id === model.id ? { ...item, enabled } : item));
+    const optimistic = client.getQueryData<Model[]>(['models'])?.find(item => item.id === model.id);
     try { await accountApi.saveModel({ providerId: model.providerId, modelId: model.modelId, name: model.name, enabled, maxOutputTokens: model.maxOutputTokens, defaultReasoning: model.defaultReasoning }, model.id); }
-    catch (e) { if (previous) client.setQueryData(['models'], previous); setFeedback({ error: errorText(e), notice: '' }); }
+    catch (e) {
+      if (revision !== sessionRequestRevision()) return;
+      if (previous && optimistic) client.setQueryData<Model[]>(['models'], current => current?.map(item => item === optimistic ? previous : item));
+      if (active.current) setFeedback({ error: errorText(e), notice: '' });
+    }
+  } });
+  const toggleModel = (model: Model, enabled: boolean) => {
+    // The mutation cache locks immediately and remains shared when this detail pane remounts.
+    if (client.isMutating({ mutationKey: toggleKey, predicate: mutation => (mutation.state.variables as { model: Model }).model.id === model.id })) return;
+    toggle.mutate({ model, enabled, revision: sessionRequestRevision() });
   };
   const openModelEditor = (model: Model) => { setEditing(model.id); setModelDraft({ maxOutputTokens: model.maxOutputTokens, defaultReasoning: { ...model.defaultReasoning } }); };
   const saveModelEditor = async (model: Model) => {
@@ -228,7 +243,7 @@ function ProviderDetail({ provider, isNew, drafts, guard, onCreated, onCancelNew
           </div>
           <p className="field-hint">{model.capabilities.known ? `${model.capabilities.family} · 输出上限 ${model.maxOutputTokens} tokens` : '思考能力未核实 · 普通文本请求'}</p>
           <div className="settings-card-actions">
-            <label className="check-field"><input type="checkbox" aria-label={`启用${model.name}`} checked={model.enabled} onChange={event => void toggleModel(model, event.target.checked)} />启用</label>
+            <label className="check-field"><input type="checkbox" aria-label={`启用${model.name}`} checked={model.enabled} disabled={pendingToggles.includes(model.id)} onChange={event => toggleModel(model, event.target.checked)} />启用</label>
             <button type="button" className="secondary-button" aria-label={`将${model.name}设为默认`} disabled={!model.enabled || !provider.enabled || preferences.data?.defaultModelId === model.id} onClick={() => void modelAction.run(async () => { await accountApi.savePreferences(model.id); await invalidateModels(); }, '默认模型已保存。')}>设为默认</button>
             <button type="button" className="secondary-button" aria-label={`编辑${model.name}的思考参数`} onClick={() => openModelEditor(model)}>思考参数</button>
             <ConfirmDelete title={model.name} remove={async () => { await accountApi.removeModel(model.id); await invalidateModels(); }}>删除后无法使用此模型发送新消息，历史仍然保留。</ConfirmDelete>
@@ -270,7 +285,7 @@ export function ProviderWorkspace() {
     navigate(target === 'new' || target === '__back__' ? '/settings/providers' : `/settings/providers/${encodeURIComponent(target)}`);
   };
   const requestSwitch = (target: string) => {
-    if (target === 'new' ? adding : target === selectedId) return;
+    if (target === 'new' ? adding : target === selectedId) { setMobileView('detail'); return; }
     if (guard.current.dirty()) { setPendingSwitch({ target }); return; }
     applySwitch(target);
   };
@@ -282,7 +297,7 @@ export function ProviderWorkspace() {
   };
   const goBack = () => requestSwitch('__back__');
   const onCreated = (created: Provider) => {
-    client.setQueryData<Provider[]>(['providers'], previous => previous ? [...previous, created] : [created]);
+    client.setQueryData<Provider[]>(['providers'], previous => [...(previous || []).filter(provider => provider.id !== created.id), created]);
     applySwitch(created.id);
     // The first save of a provider discovers its models once; later name edits do not refetch.
     void client.fetchQuery({ queryKey: candidateKey(created), queryFn: () => fetchCandidates(created), staleTime: 0 }).catch(() => {});

@@ -38,6 +38,30 @@ it('keeps pre-acceptance errors separate from submitted messages', async () => {
   expect(h.accepted).toEqual([]); expect(h.errors.at(-1)).toBe('提交失败'); expect(h.busy.at(-1)).toBe(false);
 });
 
+it('removes unsaved message previews when creating the conversation is rejected', async () => {
+  const h = harness(); h.api.create = async () => { throw new Error('服务暂时不可用。'); };
+  const g = new GenerationCoordinator(h.deps); expect(await g.send('可恢复输入')).toBe(false);
+  expect(h.previews.at(-1)).toBeUndefined();
+  expect(h.published).toEqual([]);
+  expect(h.accepted).toEqual([]);
+  expect(h.errors.at(-1)).toBe('服务暂时不可用。');
+});
+
+it('ignores a reconciliation snapshot after the generation has stopped', async () => {
+  const h = harness(); let resolveGet!: (c: Conversation) => void; let submitted!: GenerationInput;
+  h.api.generate = async (_id, input) => { submitted = input; throw new Error('不确定提交'); };
+  h.api.get = () => new Promise(done => { resolveGet = done; });
+  const g = new GenerationCoordinator(h.deps); const pending = g.send('问题'); await flush();
+  g.stop(); const count = h.published.length;
+  resolveGet({ id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [
+    { id: submitted.userMessageId, conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: '2026-10-10T00:00:00Z' },
+    { id: submitted.assistantMessageId, conversationId: 'chat', role: 'assistant', content: '迟到回答', status: 'streaming', createdAt: '2026-10-10T00:00:00Z' },
+  ] });
+  await pending;
+  expect(h.accepted).toEqual([]); expect(h.published).toHaveLength(count);
+  expect(h.previews.at(-1)).toBeUndefined();
+});
+
 it('a cancelled old create cannot navigate or release a newer generation slot', async () => {
   const h = harness(); const create = h.api.create; let resolve!: (c: Conversation) => void;
   h.api.create = () => new Promise<Conversation>(done => { resolve = done; });

@@ -80,7 +80,7 @@ func (a *App) recoverInterrupted(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback(ctx)
+	defer rollbackTransaction(tx)
 	if _, err = tx.Exec(ctx, "UPDATE messages SET status='stopped' WHERE status IN ('pending','streaming')"); err != nil {
 		return err
 	}
@@ -96,7 +96,7 @@ func (a *App) begin(ctx context.Context, uid, cid string, in *generationInput) (
 	if err != nil {
 		return snap, upstream.ProviderConfig{}, nil, err
 	}
-	defer tx.Rollback(context.Background())
+	defer rollbackTransaction(tx)
 	var id string
 	if err = tx.QueryRow(ctx, "SELECT id FROM conversations WHERE id=$1 AND user_id=$2 FOR UPDATE", cid, uid).Scan(&id); err != nil {
 		return snap, upstream.ProviderConfig{}, nil, err
@@ -218,21 +218,31 @@ func durableContext() (context.Context, context.CancelFunc) {
 }
 
 // appendDelta persists one merged batch of visible text with a single atomic
-// statement instead of BEGIN + two UPDATEs + COMMIT. Both data-modifying CTEs
-// keep the original lock order (generations → messages) and every ownership and
-// activity predicate, and the statement is rejected as inactive unless it moves
-// exactly one active generation row and exactly one active assistant message.
+// statement instead of BEGIN + two UPDATEs + COMMIT. Lock and validate the pair
+// in generation → message order before either UPDATE, so an inactive or stale
+// row cannot partially update its counterpart. Updates depend on that same pair
+// and return success only after both rows have been persisted.
 func (a *App) appendDelta(uid, cid, gid, assistantID, delta string) error {
 	ctx, cancel := durableContext()
 	defer cancel()
 	var updated string
 	var messages int
 	err := a.pool.QueryRow(ctx, `WITH generation AS (
-		UPDATE generations SET status='streaming' WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND status IN ('pending','streaming') RETURNING id
+		SELECT id,assistant_message_id FROM generations
+		WHERE id=$1 AND user_id=$2 AND conversation_id=$3 AND assistant_message_id=$5 AND status IN ('pending','streaming')
+		FOR UPDATE
 	), message AS (
-		UPDATE messages SET content=content || $4,status='streaming' WHERE id=$5 AND user_id=$2 AND conversation_id=$3 AND generation_id=$1 AND status IN ('pending','streaming') RETURNING id
+		SELECT m.id FROM messages m JOIN generation g ON g.assistant_message_id=m.id
+		WHERE m.id=$5 AND m.user_id=$2 AND m.conversation_id=$3 AND m.generation_id=$1 AND m.role='assistant' AND m.status IN ('pending','streaming')
+		FOR UPDATE OF m
+	), updated_generation AS (
+		UPDATE generations g SET status='streaming' FROM message m
+		WHERE g.id=$1 AND g.assistant_message_id=m.id RETURNING g.id
+	), updated_message AS (
+		UPDATE messages m SET content=m.content || $4,status='streaming' FROM updated_generation g
+		WHERE m.id=$5 AND m.generation_id=g.id RETURNING m.id
 	)
-	SELECT COALESCE((SELECT id::text FROM generation),''),(SELECT count(*) FROM message)`, gid, uid, cid, delta, assistantID).Scan(&updated, &messages)
+	SELECT COALESCE((SELECT id::text FROM updated_generation),''),(SELECT count(*) FROM updated_message)`, gid, uid, cid, delta, assistantID).Scan(&updated, &messages)
 	if err != nil {
 		return err
 	}
@@ -248,7 +258,7 @@ func (a *App) finish(uid, cid, gid, status string, problem *messageError, metada
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
+	defer rollbackTransaction(tx)
 	var assistantID string
 	err = tx.QueryRow(ctx, "UPDATE generations SET status=$1 WHERE id=$2 AND user_id=$3 AND conversation_id=$4 AND status IN ('pending','streaming') RETURNING assistant_message_id", status, gid, uid, cid).Scan(&assistantID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -639,7 +649,7 @@ func (a *App) stop(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	defer tx.Rollback(ctx)
+	defer rollbackTransaction(tx)
 	var id string
 	if err = tx.QueryRow(ctx, "SELECT id FROM conversations WHERE id=$1 AND user_id=$2 FOR UPDATE", cid, uid).Scan(&id); err != nil {
 		dbError(w, err)

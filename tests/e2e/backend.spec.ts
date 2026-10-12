@@ -38,7 +38,11 @@ async function configure(page: Page) {
   const row = page.locator('.model-row').filter({ hasText: 'gpt-5.1' });
   await expect(row).toBeVisible();
   await row.getByRole('button', { name: '思考参数' }).click();
-  await row.getByLabel('思考档位', { exact: true }).selectOption('medium');
+  // The nested label's text also contains the option text; use the control's
+  // accessible name, which excludes those options, rather than exact label text.
+  const effort = row.getByRole('combobox', { name: '思考档位', exact: true });
+  await effort.selectOption('medium');
+  await expect(effort).toHaveValue('medium');
   await row.getByRole('button', { name: '保存参数' }).click();
   await expect(page.getByRole('status').filter({ hasText: '原生思考参数' })).toBeVisible({ timeout: 20000 });
   await row.getByRole('button', { name: /设为默认/ }).click();
@@ -112,9 +116,19 @@ for (const width of [1440, 1024, 390]) {
     for (const section of ['providers', 'models', 'account']) {
       await page.goto(`/settings/${section}`);
       await expect(page.getByRole('navigation', { name: '设置分类' })).toBeVisible();
+      if (section === 'providers' && width === 390) {
+        await expect(page.locator('.provider-workspace')).toHaveAttribute('data-view', 'list');
+        await page.locator('.provider-row').filter({ hasText: '本地测试供应商' }).click();
+        await expect(page.locator('.provider-workspace')).toHaveAttribute('data-view', 'detail');
+      }
       const main = page.getByRole('main'); await expect(main.getByRole('heading', { level: 1 })).toBeVisible();
       if (section === 'providers') await expect(main.getByRole('heading', { name: '本地测试供应商', exact: true })).toBeVisible();
-      if (section === 'models') await expect(main.locator('.model-row').filter({ hasText: 'gpt-5.1' })).toBeVisible();
+      if (section === 'models') {
+        const model = main.getByRole('article').filter({ has: page.getByRole('heading', { name: '测试推理模型', exact: true }) });
+        await expect(model).toBeVisible();
+        await expect(model.locator('.provider-url')).toHaveText('gpt-5.1');
+        await expect(model.getByText('默认模型', { exact: true })).toBeVisible();
+      }
       if (section === 'account') await expect(main.getByLabel('确认新密码', { exact: true })).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
       await page.screenshot({ path: `test-results/screenshots/backend-settings-${section}-${width}.png`, fullPage: true });

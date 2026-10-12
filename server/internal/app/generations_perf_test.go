@@ -714,6 +714,16 @@ func TestAppendDeltaRejectsForeignRowsAndInactiveGenerations(t *testing.T) {
 			if !errors.Is(err, errInactive) {
 				t.Fatalf("%s returned %v, want errInactive", testCase.name, err)
 			}
+			var content, messageStatus, generationStatus string
+			if err := f.app.pool.QueryRow(ctx, "SELECT content,status FROM messages WHERE id=$1", mid).Scan(&content, &messageStatus); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.app.pool.QueryRow(ctx, "SELECT status FROM generations WHERE id=$1", gid).Scan(&generationStatus); err != nil {
+				t.Fatal(err)
+			}
+			if content != "已保存" || messageStatus != testCase.messageStatus || generationStatus != testCase.generationStatus {
+				t.Fatalf("rejected append changed persisted rows: content=%q message=%q generation=%q", content, messageStatus, generationStatus)
+			}
 		})
 	}
 	t.Run("foreign bindings", func(t *testing.T) {
@@ -729,6 +739,13 @@ func TestAppendDeltaRejectsForeignRowsAndInactiveGenerations(t *testing.T) {
 		}
 		if err := f.app.appendDelta(f.user, cid, gid, uuid.NewString(), "迟到片段"); !errors.Is(err, errInactive) {
 			t.Fatalf("unknown message returned %v, want errInactive", err)
+		}
+		var content, messageStatus, generationStatus string
+		if err := f.app.pool.QueryRow(ctx, "SELECT m.content,m.status,g.status FROM messages m JOIN generations g ON g.assistant_message_id=m.id WHERE m.id=$1 AND g.id=$2", mid, gid).Scan(&content, &messageStatus, &generationStatus); err != nil {
+			t.Fatal(err)
+		}
+		if content != "已保存" || messageStatus != "pending" || generationStatus != "pending" {
+			t.Fatalf("foreign binding changed persisted rows: content=%q message=%q generation=%q", content, messageStatus, generationStatus)
 		}
 	})
 	for _, record := range tracer.deltaRecords() {

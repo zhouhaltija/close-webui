@@ -46,7 +46,7 @@ export function RealModelSelector({ models, selected, reasoning }: { models: Mod
         // Keep focus in the submenu when the pointer crosses directly into it.
         if (event.relatedTarget instanceof Node && effortMenu.current?.contains(event.relatedTarget)) event.preventDefault();
       }}><span>思考设置</span><span className="effort-current">{reasoningSummary(reasoning)}</span><ChevronRight size={15} strokeWidth={1.2} /></Dropdown.SubTrigger>
-        <Dropdown.Portal><Dropdown.SubContent ref={effortMenu} className="effort-menu effort-menu-native" sideOffset={viewportWidth < 768 ? -Math.min(322, viewportWidth - 32) : 6} collisionPadding={16}>
+        <Dropdown.Portal><Dropdown.SubContent ref={effortMenu} className="effort-menu effort-menu-native" sideOffset={viewportWidth < 768 ? -Math.min(360, viewportWidth - 32) : 6} collisionPadding={16}>
           <ReasoningFields capabilities={selected.capabilities} value={reasoning} output={selected.maxOutputTokens} onChange={value => useUI.setState({ realModelId: selected.id, reasoning: value })} />
         </Dropdown.SubContent></Dropdown.Portal></Dropdown.Sub>}
       {error && <p className="submit-error" role="alert">{error}</p>}

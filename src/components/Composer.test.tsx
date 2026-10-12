@@ -1,5 +1,6 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
+import { flushSync } from 'react-dom';
 import { expect, it } from 'vitest';
 import { Composer } from './Composer';
 function Harness({ busy = false }: { busy?: boolean }) {
@@ -28,20 +29,25 @@ it('retains the Sonnet 5.5 and effort labels without unimplemented mode or servi
   expect(screen.queryByRole('button', { name: '语音输入' })).not.toBeInTheDocument();
 });
 it('keeps one stable send/stop button so a single click cannot do both', () => {
-  const { container } = render(<Harness />);
+  function SwitchingHarness() {
+    const [busy, setBusy] = useState(false);
+    const [sent, setSent] = useState(0);
+    const [stopped, setStopped] = useState(0);
+    return <><Composer value="你好" onChange={() => {}} busy={busy} onSend={() => flushSync(() => { setSent(n => n + 1); setBusy(true); })} onStop={() => flushSync(() => { setStopped(n => n + 1); setBusy(false); })} /><output aria-label="发送次数">{sent}</output><output aria-label="停止次数">{stopped}</output></>;
+  }
+  render(<SwitchingHarness />);
   const input = screen.getByRole('textbox');
-  expect(screen.queryByRole('button', { name: '发送消息' })).toBeDisabled();
-  fireEvent.change(input, { target: { value: '你好' } });
   const send = screen.getByRole('button', { name: '发送消息' });
-  expect(send).toHaveAttribute('type', 'submit');
-  fireEvent.keyDown(input, { key: 'Enter' });
+  fireEvent.click(send);
   expect(screen.getByLabelText('发送次数')).toHaveTextContent('1');
-  // Re-rendering as "stop" must reuse the same element instead of swapping two buttons.
-  const { container: busyContainer } = render(<Harness busy />);
-  const stop = within(busyContainer).getByRole('button', { name: '停止生成' });
-  expect(stop).toHaveAttribute('type', 'button');
-  expect(container).toBeTruthy();
-  expect(send).toBeTruthy();
+  const stop = screen.getByRole('button', { name: '停止生成' });
+  expect(stop).toBe(send);
+  fireEvent.click(stop);
+  expect(screen.getByLabelText('停止次数')).toHaveTextContent('1');
+  expect(screen.getByLabelText('发送次数')).toHaveTextContent('1');
+  expect(screen.getByRole('button', { name: '发送消息' })).toBe(send);
+  fireEvent.keyDown(input, { key: 'Enter' });
+  expect(screen.getByLabelText('发送次数')).toHaveTextContent('2');
 });
 it('hides send for whitespace and exposes it for meaningful text', () => {
   render(<Harness />);
@@ -50,4 +56,15 @@ it('hides send for whitespace and exposes it for meaningful text', () => {
   expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
   fireEvent.change(screen.getByRole('textbox'), { target: { value: '你好' } });
   expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+});
+
+it('keeps the send/stop element mounted but inaccessible for an empty home composer', () => {
+  const { container, rerender } = render(<Composer value="" onChange={() => {}} onSend={() => {}} onStop={() => {}} busy={false} home />);
+  const button = container.querySelector('.send-button');
+  expect(button).toHaveAttribute('hidden');
+  expect(screen.queryByRole('button', { name: '发送消息' })).not.toBeInTheDocument();
+  rerender(<Composer value="问题" onChange={() => {}} onSend={() => {}} onStop={() => {}} busy={false} home />);
+  expect(screen.getByRole('button', { name: '发送消息' })).toBe(button);
+  rerender(<Composer value="问题" onChange={() => {}} onSend={() => {}} onStop={() => {}} busy home />);
+  expect(screen.getByRole('button', { name: '停止生成' })).toBe(button);
 });

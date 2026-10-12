@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { Settings } from './Settings';
+import { invalidateSessionRequests } from '../core/api';
 
 afterEach(() => { vi.unstubAllGlobals(); });
 
@@ -18,13 +19,13 @@ const providerRow = (name: string | RegExp) => within(screen.getByRole('navigati
 type Call = { url: string; method: string; body: unknown };
 function mount(path = '/settings/providers') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes>
+  const ui = render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes>
     <Route path="/settings/providers" element={<Settings />} />
     <Route path="/settings/providers/:providerId" element={<Settings />} />
     <Route path="/settings/models" element={<Settings />} />
     <Route path="/settings/account" element={<Settings />} />
   </Routes></MemoryRouter></QueryClientProvider>);
-  return client;
+  return { client, ...ui };
 }
 function stubFetch(handler: (url: string, init: RequestInit) => Response | Promise<Response> | undefined): Call[] {
   const calls: Call[] = [];
@@ -62,6 +63,37 @@ it('selects the first provider as a safe default when the route carries no id', 
   expect(await screen.findByRole('heading', { name: '供应商甲' })).toBeVisible();
   expect(providerRow(/供应商甲/)).toHaveAttribute('aria-current', 'true');
   expect(screen.getByRole('button', { name: '拉取模型' })).toBeVisible();
+});
+
+it('opens the first provider detail from the list and can reopen it after going back', async () => {
+  stubFetch(url => url.endsWith('/providers') ? Response.json([providerA]) : undefined);
+  mount('/settings/providers');
+  await screen.findByRole('heading', { name: '供应商甲' });
+  expect(workspace()).toHaveAttribute('data-view', 'list');
+  fireEvent.click(providerRow(/供应商甲/));
+  await waitFor(() => expect(workspace()).toHaveAttribute('data-view', 'detail'));
+  fireEvent.click(screen.getByRole('button', { name: '返回供应商列表' }));
+  await waitFor(() => expect(workspace()).toHaveAttribute('data-view', 'list'));
+  fireEvent.click(providerRow(/供应商甲/));
+  await waitFor(() => expect(workspace()).toHaveAttribute('data-view', 'detail'));
+});
+
+it('shows a newly created provider only once after the provider list refreshes', async () => {
+  let created = false;
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers') && init.method === 'POST') { created = true; return Response.json(providerB); }
+    if (url.endsWith('/providers')) return Response.json(created ? [providerA, providerB] : [providerA]);
+    if (url.endsWith('/model-candidates')) return Response.json({ source: 'upstream', catalogVersion: 'v1', warning: '', models: [entry('gpt-5', 'GPT-5')] });
+    return undefined;
+  });
+  mount('/settings/providers/p1');
+  await screen.findByRole('heading', { name: '供应商甲' });
+  fireEvent.click(screen.getByRole('button', { name: '添加供应商' }));
+  fireEvent.change(screen.getByLabelText('名称'), { target: { value: '供应商乙' } });
+  fireEvent.change(screen.getByLabelText('接口地址'), { target: { value: 'https://b.example.com/v1' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存供应商' }));
+  await screen.findByRole('heading', { name: '供应商乙' });
+  expect(within(screen.getByRole('navigation', { name: '已添加供应商' })).getAllByRole('button', { name: /供应商乙/ })).toHaveLength(1);
 });
 
 it('reports a provider id that does not belong to the current account', async () => {
@@ -121,6 +153,121 @@ it('never silently drops unsaved provider edits when switching providers', async
   expect(await screen.findByRole('heading', { name: '供应商乙' })).toBeVisible();
   fireEvent.click(providerRow(/供应商甲/));
   expect(await screen.findByLabelText('名称')).toHaveValue('供应商甲');
+});
+
+it('restores a retained new provider draft when adding again', async () => {
+  stubFetch(url => url.endsWith('/providers') ? Response.json([providerA]) : undefined);
+  mount('/settings/providers/p1');
+  await screen.findByRole('heading', { name: '供应商甲' });
+  fireEvent.click(screen.getByRole('button', { name: '添加供应商' }));
+  fireEvent.change(screen.getByLabelText('名称'), { target: { value: '尚未保存的供应商' } });
+  fireEvent.change(screen.getByLabelText('接口地址'), { target: { value: 'https://draft.example.com/v1' } });
+  fireEvent.click(providerRow(/供应商甲/));
+  fireEvent.click(screen.getByRole('button', { name: '保留草稿并切换' }));
+  await screen.findByRole('heading', { name: '供应商甲' });
+  fireEvent.click(screen.getByRole('button', { name: '添加供应商' }));
+  expect(screen.getByLabelText('名称')).toHaveValue('尚未保存的供应商');
+  expect(screen.getByLabelText('接口地址')).toHaveValue('https://draft.example.com/v1');
+});
+
+it('does not restore old account models when a pending toggle fails after an identity change', async () => {
+  let releasePatch!: (response: Response) => void;
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([modelA]);
+    if (url.endsWith('/models/m1') && init.method === 'PATCH') return new Promise(resolve => { releasePatch = resolve; });
+    return undefined;
+  });
+  const { client, unmount } = mount('/settings/providers/p1');
+  fireEvent.click(await screen.findByRole('checkbox', { name: '启用模型甲' }));
+  await waitFor(() => expect(screen.getByRole('checkbox', { name: '启用模型甲' })).not.toBeChecked());
+  unmount();
+  invalidateSessionRequests();
+  client.clear();
+  client.setQueryData(['models'], [modelB]);
+  await act(async () => { releasePatch(Response.json({ error: { code: 'SAVE_FAILED', message: '旧账号保存失败。' } }, { status: 500 })); });
+  expect(client.getQueryData(['models'])).toEqual([modelB]);
+});
+
+it('does not start a queued model toggle after the account changes', async () => {
+  const calls = stubFetch(url => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([modelA]);
+    return undefined;
+  });
+  const { client } = mount('/settings/providers/p1');
+  const checkbox = await screen.findByRole('checkbox', { name: '启用模型甲' });
+  await act(async () => {
+    fireEvent.click(checkbox);
+    invalidateSessionRequests();
+    client.clear();
+    client.setQueryData(['models'], [modelB]);
+  });
+  expect(client.getQueryData(['models'])).toEqual([modelB]);
+  expect(calls.filter(call => call.method === 'PATCH')).toHaveLength(0);
+});
+
+it('restores the toggled model and shows its error when saving fails in the current account', async () => {
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([modelA]);
+    if (url.endsWith('/models/m1') && init.method === 'PATCH') return Response.json({ error: { code: 'SAVE_FAILED', message: '无法保存模型开关。' } }, { status: 500 });
+    return undefined;
+  });
+  mount('/settings/providers/p1');
+  fireEvent.click(await screen.findByRole('checkbox', { name: '启用模型甲' }));
+  expect(await screen.findByRole('alert')).toHaveTextContent('无法保存模型开关。');
+  expect(screen.getByRole('checkbox', { name: '启用模型甲' })).toBeChecked();
+});
+
+it('rolls back only the failed toggle after switching providers without losing newer model changes', async () => {
+  let releasePatch!: (response: Response) => void;
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers')) return Response.json([providerA, providerB]);
+    if (url.endsWith('/models')) return Response.json([modelA, modelB]);
+    if (url.endsWith('/models/m1') && init.method === 'PATCH') return new Promise(resolve => { releasePatch = resolve; });
+    return undefined;
+  });
+  const { client } = mount('/settings/providers/p1');
+  fireEvent.click(await screen.findByRole('checkbox', { name: '启用模型甲' }));
+  client.setDefaultOptions({ queries: { retry: false, staleTime: Infinity } });
+  fireEvent.click(providerRow(/供应商乙/));
+  await screen.findByRole('heading', { name: '供应商乙' });
+  expect(client.getQueryData<typeof modelA[]>(['models'])?.find(model => model.id === 'm1')?.enabled).toBe(false);
+  act(() => client.setQueryData<typeof modelA[]>(['models'], current => current?.map(model => model.id === 'm2' ? { ...model, enabled: false } : model)));
+  await act(async () => { releasePatch(Response.json({ error: { code: 'SAVE_FAILED', message: '供应商甲的开关保存失败。' } }, { status: 500 })); });
+  expect(client.getQueryData(['models'])).toEqual([modelA, { ...modelB, enabled: false }]);
+  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  fireEvent.click(providerRow(/供应商甲/));
+  expect(await screen.findByRole('checkbox', { name: '启用模型甲' })).toBeChecked();
+});
+
+it('blocks repeated toggles of a pending model while allowing another model to save', async () => {
+  const otherModel = { ...modelB, providerId: 'p1' };
+  const patches: { id: string; release: (response: Response) => void }[] = [];
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([modelA, otherModel]);
+    if (init.method === 'PATCH' && /\/models\/m[12]$/.test(url)) return new Promise(resolve => { patches.push({ id: url.split('/').at(-1)!, release: resolve }); });
+    return undefined;
+  });
+  const { client } = mount('/settings/providers/p1');
+  const first = await screen.findByRole('checkbox', { name: '启用模型甲' });
+  const second = screen.getByRole('checkbox', { name: '启用模型乙' });
+  fireEvent.click(first);
+  fireEvent.click(first);
+  fireEvent.click(second);
+  await waitFor(() => expect(patches.map(patch => patch.id)).toEqual(['m1', 'm2']));
+  expect(first).toBeDisabled();
+  expect(second).toBeDisabled();
+  await act(async () => { patches[1].release(Response.json({ ...otherModel, enabled: false })); });
+  await waitFor(() => expect(second).toBeEnabled());
+  expect(first).toBeDisabled();
+  await act(async () => { patches[0].release(Response.json({ error: { code: 'SAVE_FAILED', message: '开关保存失败。' } }, { status: 500 })); });
+  await waitFor(() => expect(first).toBeEnabled());
+  expect(first).toBeChecked();
+  expect(second).not.toBeChecked();
+  expect(client.getQueryData(['models'])).toEqual([modelA, { ...otherModel, enabled: false }]);
 });
 
 it('keeps the retained provider key when the key field is left blank', async () => {

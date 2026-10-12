@@ -88,7 +88,7 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	defer tx.Rollback(r.Context())
+	defer rollbackTransaction(tx)
 	q := a.queries.WithTx(tx)
 	u, err := q.CreateUser(r.Context(), db.CreateUserParams{ID: uuid.NewString(), Username: in.Username, PasswordHash: hash})
 	if err != nil {
@@ -127,7 +127,7 @@ func (a *App) login(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	defer tx.Rollback(r.Context())
+	defer rollbackTransaction(tx)
 	var u db.User
 	err = tx.QueryRow(r.Context(), "SELECT id,username,password_hash,created_at FROM users WHERE username=$1 FOR UPDATE", in.Username).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -201,7 +201,7 @@ func (a *App) password(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	defer tx.Rollback(r.Context())
+	defer rollbackTransaction(tx)
 	id := currentUser(r).ID
 	var hash string
 	if err = tx.QueryRow(r.Context(), "SELECT password_hash FROM users WHERE id=$1 FOR UPDATE", id).Scan(&hash); err != nil {
