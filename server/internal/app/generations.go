@@ -44,14 +44,16 @@ type generationInput struct {
 	Reasoning          *upstream.Reasoning `json:"reasoning,omitempty"`
 }
 type snapshot struct {
-	ModelID         string             `json:"modelId"`
-	ProviderID      string             `json:"providerId"`
-	NativeModelID   string             `json:"nativeModelId"`
-	Protocol        string             `json:"protocol"`
-	Adapter         string             `json:"adapter"`
-	BaseURL         string             `json:"baseUrl"`
-	MaxOutputTokens int                `json:"maxOutputTokens"`
-	Reasoning       upstream.Reasoning `json:"reasoning"`
+	ModelID              string                  `json:"modelId"`
+	ProviderID           string                  `json:"providerId"`
+	NativeModelID        string                  `json:"nativeModelId"`
+	Protocol             string                  `json:"protocol"`
+	Adapter              string                  `json:"adapter"`
+	BaseURL              string                  `json:"baseUrl"`
+	MaxOutputTokens      int                     `json:"maxOutputTokens"`
+	Reasoning            upstream.Reasoning      `json:"reasoning"`
+	DiscoveryMetadata    *upstream.ModelMetadata `json:"discoveryMetadata,omitempty"`
+	DiscoveryFingerprint string                  `json:"discoveryFingerprint,omitempty"`
 }
 type metadataEnvelope struct {
 	ProviderID            string          `json:"providerId"`
@@ -151,6 +153,9 @@ func (a *App) begin(ctx context.Context, uid, cid string, in *generationInput) (
 		if snap.ProviderID != p.ID || snap.NativeModelID != m.ModelID || snap.Protocol != p.Protocol || snap.Adapter != p.Adapter || snap.BaseURL != p.BaseUrl {
 			return snap, provider, nil, reject(409, "CONFIGURATION_CHANGED", "原供应商或模型配置已改变，请发送新消息。")
 		}
+		if snap.DiscoveryFingerprint != "" && snap.DiscoveryFingerprint != connectionFingerprint(p) {
+			return snap, provider, nil, reject(409, "CONFIGURATION_CHANGED", "原供应商连接凭据已改变，请发送新消息。")
+		}
 	} else {
 		var reasoning upstream.Reasoning
 		_ = json.Unmarshal(m.DefaultReasoning, &reasoning)
@@ -158,9 +163,13 @@ func (a *App) begin(ctx context.Context, uid, cid string, in *generationInput) (
 			reasoning = *in.Reasoning
 		}
 		snap = snapshot{ModelID: m.ID, ProviderID: p.ID, NativeModelID: m.ModelID, Protocol: p.Protocol, Adapter: p.Adapter, BaseURL: p.BaseUrl, MaxOutputTokens: int(m.MaxOutputTokens), Reasoning: reasoning}
+		snap.DiscoveryMetadata = effectiveMetadata(p, m)
+		if snap.DiscoveryMetadata != nil {
+			snap.DiscoveryFingerprint = connectionFingerprint(p)
+		}
 		in.Reasoning = &reasoning
 	}
-	if err = upstream.ValidateReasoning(upstream.Capabilities(snap.Adapter, snap.Protocol, snap.NativeModelID), snap.Reasoning, snap.MaxOutputTokens); err != nil {
+	if err = upstream.ValidateReasoning(upstream.CapabilitiesWithMetadata(snap.Adapter, snap.Protocol, snap.NativeModelID, snap.DiscoveryMetadata), snap.Reasoning, snap.MaxOutputTokens); err != nil {
 		return snap, provider, nil, reject(400, "INVALID_REASONING", err.Error())
 	}
 	reasoning, _ := json.Marshal(snap.Reasoning)
@@ -369,7 +378,7 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 	}
 	updates := make(chan streamUpdate, 16)
 	go func() {
-		meta, e := a.upstream.Stream(ctx, provider, upstream.ModelConfig{ModelID: snap.NativeModelID, MaxOutputTokens: snap.MaxOutputTokens, Reasoning: snap.Reasoning}, history, func(text string) error {
+		meta, e := a.upstream.Stream(ctx, provider, upstream.ModelConfig{ModelID: snap.NativeModelID, MaxOutputTokens: snap.MaxOutputTokens, Reasoning: snap.Reasoning, Metadata: snap.DiscoveryMetadata}, history, func(text string) error {
 			select {
 			case updates <- streamUpdate{text: text}:
 				return nil

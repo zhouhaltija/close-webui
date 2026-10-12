@@ -44,16 +44,17 @@ type Message struct {
 }
 
 type Model struct {
-	ID               string    `json:"id"`
-	UserID           string    `json:"user_id"`
-	ProviderID       string    `json:"provider_id"`
-	ModelID          string    `json:"model_id"`
-	Name             string    `json:"name"`
-	Enabled          bool      `json:"enabled"`
-	MaxOutputTokens  int32     `json:"max_output_tokens"`
-	DefaultReasoning []byte    `json:"default_reasoning"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID                string    `json:"id"`
+	UserID            string    `json:"user_id"`
+	ProviderID        string    `json:"provider_id"`
+	ModelID           string    `json:"model_id"`
+	Name              string    `json:"name"`
+	Enabled           bool      `json:"enabled"`
+	MaxOutputTokens   int32     `json:"max_output_tokens"`
+	DefaultReasoning  []byte    `json:"default_reasoning"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	DiscoveryMetadata []byte    `json:"discovery_metadata"`
 }
 
 type Preference struct {

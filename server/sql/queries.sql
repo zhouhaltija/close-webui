@@ -31,9 +31,11 @@ SELECT * FROM models WHERE user_id=$1 ORDER BY created_at,id;
 -- name: GetModel :one
 SELECT * FROM models WHERE id=$1 AND user_id=$2;
 -- name: CreateModel :one
-INSERT INTO models (id,user_id,provider_id,model_id,name,enabled,max_output_tokens,default_reasoning) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *;
+INSERT INTO models (id,user_id,provider_id,model_id,name,enabled,max_output_tokens,default_reasoning,discovery_metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE(sqlc.narg(discovery_metadata)::jsonb,'{}'::jsonb)) RETURNING *;
 -- name: UpdateModel :one
-UPDATE models SET provider_id=$3,model_id=$4,name=$5,enabled=$6,max_output_tokens=$7,default_reasoning=$8,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING *;
+UPDATE models SET provider_id=$3,model_id=$4,name=$5,enabled=$6,max_output_tokens=$7,default_reasoning=$8,discovery_metadata=COALESCE(sqlc.narg(discovery_metadata)::jsonb,'{}'::jsonb),updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING *;
+-- name: UpdateDiscoveredModelsMetadata :exec
+UPDATE models SET discovery_metadata=records.metadata FROM jsonb_to_recordset(sqlc.arg(discovery_records)::jsonb) AS records(model_id text, metadata jsonb) WHERE models.user_id=$1 AND models.provider_id=$2 AND models.model_id=records.model_id;
 -- name: DeleteModel :execrows
 DELETE FROM models WHERE id=$1 AND user_id=$2;
 -- name: GetPreferences :one

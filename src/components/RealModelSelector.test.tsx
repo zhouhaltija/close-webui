@@ -3,7 +3,13 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, expect, it } from 'vitest';
 import { useUI } from '../core/ui-store';
 import type { Model, Reasoning } from '../core/types';
-import { RealModelSelector } from './RealModelSelector';
+import { RealModelSelector, reasoningSummary } from './RealModelSelector';
+
+it('describes semantic automatic and disabled thinking budgets in the trigger', () => {
+  expect(reasoningSummary({ budgetTokens: -1 })).toBe('自动预算');
+  expect(reasoningSummary({ budgetTokens: 0 })).toBe('关闭思考');
+  expect(reasoningSummary({ budgetTokens: 2048 })).toBe('预算 2048');
+});
 
 afterEach(() => {
   // Close any Radix layer a test left open so its aria-hidden bookkeeping cannot leak.

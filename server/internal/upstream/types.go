@@ -29,6 +29,9 @@ type Capability struct {
 	ManualBudget           bool     `json:"manualBudget"`
 	EffortWhileDisabled    bool     `json:"effortWhileDisabled"`
 	DisabledEffortLimited  bool     `json:"disabledEffortLimited"`
+	ReasoningSupported     *bool    `json:"reasoningSupported,omitempty"`
+	OutputSource           string   `json:"outputSource,omitempty"`
+	ContextWindow          int      `json:"contextWindow,omitempty"`
 }
 type Template struct {
 	ID       string `json:"id"`
@@ -42,13 +45,15 @@ type ModelConfig struct {
 	ModelID         string
 	MaxOutputTokens int
 	Reasoning       Reasoning
+	Metadata        *ModelMetadata
 }
 type Message struct {
 	Role, Content string
 	Metadata      json.RawMessage
 }
 type DiscoveredModel struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID       string         `json:"id"`
+	Name     string         `json:"name"`
+	Metadata *ModelMetadata `json:"metadata,omitempty"`
 }
 type Client struct{ http *http.Client }

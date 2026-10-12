@@ -1,11 +1,12 @@
 import { useState } from 'react';
 import { Link, NavLink, useLocation } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, Search } from 'lucide-react';
+import { ArrowLeft, Search, Settings2 } from 'lucide-react';
 import { accountApi } from '../core/api';
 import { errorText } from '../core/errors';
 import { UserMenu, useAuth } from './Auth';
 import { ConfirmDelete, Feedback, ProviderWorkspace, useAction } from './ProviderWorkspace';
+import { ModelMetadata } from './ModelMetadata';
 
 /** Global model summary: cross-provider default preference and filtering, without a second provider choice. */
 function Models() {
@@ -24,18 +25,17 @@ function Models() {
       : !defaultModel.enabled || !providerOf(defaultModel.providerId)?.enabled ? '默认模型或其供应商已停用，请在聊天输入框明确选择其他模型，不会自动替换。' : '';
   const needle = filter.trim().toLowerCase();
   const visible = all.filter(model => !needle || model.name.toLowerCase().includes(needle) || model.modelId.toLowerCase().includes(needle));
-  return <><div className="settings-section-title"><div><h1>模型</h1><p>跨供应商汇总已添加模型并设置默认模型；添加、拉取与参数编辑在供应商工作区完成。</p></div></div>
+  return <><div className="settings-section-title"><div><h1>模型</h1><p>选择默认模型，调整每次回复的长度与思考行为。</p></div><span className="section-count">{all.length} 个模型</span></div>
     {notice && <p className="settings-notice" role="status">{notice}</p>}
     <div className="model-search"><Search size={14} strokeWidth={1.4} aria-hidden /><input aria-label="搜索模型" placeholder="搜索模型" value={filter} onChange={event => setFilter(event.target.value)} /></div>
     <Feedback {...action} />
     {providers.isError && <p role="alert" className="submit-error">{errorText(providers.error)}</p>}
-    {models.isPending ? <p role="status">正在加载模型…</p> : models.isError ? <p className="submit-error" role="alert">{errorText(models.error)}<button className="text-button" onClick={() => void models.refetch()}>重试</button></p> : <div className="settings-list">
-      {!visible.length && <div className="settings-empty"><h2>还没有模型</h2><p>在<Link className="inline-link" to="/settings/providers">供应商工作区</Link>拉取候选或手动添加模型。</p></div>}
-      {visible.map(model => { const provider = providerOf(model.providerId); return <article className="settings-card" key={model.id}>
-        <div className="settings-card-heading"><div><h2>{model.name}</h2><p>{provider?.name || '已删除的供应商'} · {model.enabled ? '已启用' : '已停用'}</p></div>{preferences.data?.defaultModelId === model.id && <span className="status-pill">默认模型</span>}</div>
-        <p className="provider-url">{model.modelId}</p>
-        <p className="field-hint">{model.capabilities.known ? `${model.capabilities.family} · 输出上限 ${model.maxOutputTokens} tokens` : '思考能力未核实 · 普通文本请求'}</p>
-        <div className="settings-card-actions"><button className="secondary-button" disabled={action.pending || !model.enabled || !provider?.enabled || preferences.data?.defaultModelId === model.id} onClick={() => void action.run(async () => { await accountApi.savePreferences(model.id); await invalidate(); }, '默认模型已保存。')}>设为默认</button><ConfirmDelete title={model.name} remove={async () => { await accountApi.removeModel(model.id); await invalidate(); }}>删除后无法使用此模型发送新消息，历史仍然保留。</ConfirmDelete></div>
+    {models.isPending ? <p role="status">正在加载模型…</p> : models.isError ? <p className="submit-error" role="alert">{errorText(models.error)}<button className="text-button" onClick={() => void models.refetch()}>重试</button></p> : <div className="settings-list global-model-list">
+      {!visible.length && <div className="settings-empty"><h2>{needle ? '没有匹配的模型' : '还没有模型'}</h2>{needle ? <p>试试其他名称或模型 ID。</p> : <p>在<Link className="inline-link" to="/settings/providers">供应商工作区</Link>拉取候选或手动添加模型。</p>}</div>}
+      {visible.map(model => { const provider = providerOf(model.providerId); return <article className="settings-card model-row" key={model.id}>
+        <div className="model-row-heading"><div className="model-row-copy"><div className="model-name-line"><h2>{model.name}</h2>{preferences.data?.defaultModelId === model.id && <span className="status-pill">默认模型</span>}</div><p className="model-row-provider">{provider?.name || '已删除的供应商'} · {model.enabled ? '已启用' : '已停用'}</p><p className="model-row-id">{model.modelId}</p></div><Link className="secondary-button model-config-button" aria-label={`${model.name}的模型设置`} to={`/settings/providers/${encodeURIComponent(model.providerId)}?model=${encodeURIComponent(model.id)}`}><Settings2 size={14} />模型设置</Link></div>
+        <ModelMetadata capabilities={model.capabilities} output={model.maxOutputTokens} reasoning={model.defaultReasoning} />
+        <div className="model-secondary-actions"><button className="secondary-button" disabled={action.pending || !model.enabled || !provider?.enabled || preferences.data?.defaultModelId === model.id} onClick={() => void action.run(async () => { await accountApi.savePreferences(model.id); await invalidate(); }, '默认模型已保存。')}>设为默认</button><ConfirmDelete title={model.name} remove={async () => { await accountApi.removeModel(model.id); await invalidate(); }}>删除后无法使用此模型发送新消息，历史仍然保留。</ConfirmDelete></div>
       </article>; })}
     </div>}
   </>;

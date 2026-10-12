@@ -381,7 +381,7 @@ it('allows explicitly resetting stale native defaults before saving an unknown m
     return undefined;
   });
   mount('/settings/providers/p1');
-  fireEvent.click(await screen.findByRole('button', { name: '编辑能力变更模型的思考参数' }));
+  fireEvent.click(await screen.findByRole('button', { name: '能力变更模型的模型设置' }));
   expect(screen.getByRole('alert')).toHaveTextContent('尚未核实思考能力');
   expect(screen.getByRole('button', { name: '保存参数' })).toBeDisabled();
   expect(saved).toBeUndefined();
@@ -488,4 +488,126 @@ it('warns when the saved default model was deleted', async () => {
   });
   mount('/settings/models');
   expect(await screen.findByText(/默认模型已被删除/)).toBeVisible();
+});
+
+it('filters providers without changing the selected detail', async () => {
+  stubFetch(url => url.endsWith('/providers') ? Response.json([providerA, providerB]) : undefined);
+  mount('/settings/providers/p1');
+  await screen.findByRole('heading', { name: '供应商甲' });
+  fireEvent.change(screen.getByLabelText('搜索供应商'), { target: { value: '供应商乙' } });
+  expect(providerRow(/供应商乙/)).toBeVisible();
+  expect(within(screen.getByRole('navigation', { name: '已添加供应商' })).queryByRole('button', { name: /供应商甲/ })).not.toBeInTheDocument();
+  expect(screen.getByLabelText('名称')).toHaveValue('供应商甲');
+  fireEvent.change(screen.getByLabelText('搜索供应商'), { target: { value: '不存在' } });
+  expect(screen.getByText('没有匹配的供应商')).toBeVisible();
+});
+
+it('opens the exact provider model settings from the global summary', async () => {
+  let saved: unknown;
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers')) return Response.json([providerA, providerB]);
+    if (url.endsWith('/models/m2') && init.method === 'PATCH') { saved = JSON.parse(init.body as string); return Response.json(modelB); }
+    if (url.endsWith('/models')) return Response.json([modelA, modelB]);
+    return undefined;
+  });
+  mount('/settings/models');
+  fireEvent.click(await screen.findByRole('link', { name: '模型乙的模型设置' }));
+  expect(await screen.findByRole('heading', { name: '供应商乙' })).toBeVisible();
+  const editor = within(await screen.findByRole('region', { name: '模型乙的模型设置' }));
+  expect(editor.getByLabelText('输出上限')).toHaveValue(4096);
+  fireEvent.change(editor.getByLabelText('输出上限'), { target: { value: '6000' } });
+  fireEvent.change(editor.getByLabelText('思考档位'), { target: { value: 'high' } });
+  fireEvent.click(editor.getByRole('button', { name: '保存参数' }));
+  await waitFor(() => expect(saved).toMatchObject({ providerId: 'p2', modelId: 'gpt-5', maxOutputTokens: 6000, defaultReasoning: { effort: 'high' } }));
+});
+
+it('keeps unknown output visible and separates it from a conservative bound', async () => {
+  stubFetch(url => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([{ ...modelA, capabilities: { ...capabilities, known: false, efforts: [], outputMax: 4096 } }]);
+    return undefined;
+  });
+  mount('/settings/models');
+  expect(await screen.findByText('每次回复上限 4,096 tokens')).toBeVisible();
+  expect(screen.getByText('保守输出上限 4,096 tokens')).toBeVisible();
+  expect(screen.getByText('思考能力未核实')).toBeVisible();
+  fireEvent.change(screen.getByLabelText('搜索模型'), { target: { value: '不存在' } });
+  expect(screen.getByRole('heading', { name: '没有匹配的模型' })).toBeVisible();
+  expect(screen.queryByRole('heading', { name: '还没有模型' })).not.toBeInTheDocument();
+});
+
+it('exposes the trusted maximum and current reasoning default in model rows', async () => {
+  stubFetch(url => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([{ ...modelA, defaultReasoning: { effort: 'high' } }]);
+    return undefined;
+  });
+  mount('/settings/providers/p1');
+  expect(await screen.findByText('模型最大输出 8,192 tokens')).toBeVisible();
+  expect(screen.getByText(/思考档位 · 当前：高/)).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: '模型甲的模型设置' }));
+  expect(screen.getByRole('region', { name: '模型甲的模型设置' })).toBeVisible();
+});
+
+it('refreshes saved model capabilities after discovery without changing user defaults', async () => {
+  let discovered = false;
+  stubFetch(url => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([{ ...modelA, defaultReasoning: { effort: 'high' }, capabilities: { ...capabilities, outputMax: discovered ? 32768 : 8192 } }]);
+    if (url.endsWith('/model-candidates')) { discovered = true; return Response.json({ source: 'upstream', catalogVersion: 'v2', models: [entry('gpt-4o', '候选甲')] }); }
+    return undefined;
+  });
+  mount('/settings/providers/p1');
+  expect(await screen.findByText('模型最大输出 8,192 tokens')).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: '拉取模型' }));
+  expect(await screen.findByText('模型最大输出 32,768 tokens')).toBeVisible();
+  const savedRow = within(screen.getByRole('heading', { name: '模型甲' }).closest('article')!);
+  expect(savedRow.getByText('每次回复上限 4,096 tokens')).toBeVisible();
+  expect(savedRow.getByText('思考档位 · 当前：高')).toBeVisible();
+});
+
+it('drops candidates and reloads capabilities after a key-only provider save', async () => {
+  let updated = false;
+  const versionedProvider = () => ({ ...providerA, updatedAt: updated ? 'v2' : 'v1' });
+  stubFetch((url, init) => {
+    if (url.endsWith('/providers/p1') && init.method === 'PATCH') { updated = true; return Response.json(versionedProvider()); }
+    if (url.endsWith('/providers')) return Response.json([versionedProvider()]);
+    if (url.endsWith('/models')) return Response.json([{ ...modelA, capabilities: { ...capabilities, outputMax: updated ? 32768 : 8192 } }]);
+    if (url.endsWith('/model-candidates')) return Response.json({ source: 'upstream', catalogVersion: 'v1', models: [entry('old-model', '旧连接候选')] });
+    return undefined;
+  });
+  mount('/settings/providers/p1');
+  fireEvent.click(await screen.findByRole('button', { name: '拉取模型' }));
+  expect(await screen.findByText('旧连接候选')).toBeVisible();
+  fireEvent.change(screen.getByLabelText('API 密钥'), { target: { value: 'test-only-key' } });
+  fireEvent.click(screen.getByRole('button', { name: '保存供应商' }));
+  expect(await screen.findByText('供应商已保存。')).toBeVisible();
+  await waitFor(() => expect(screen.queryByText('旧连接候选')).not.toBeInTheDocument());
+  expect(await screen.findByText('模型最大输出 32,768 tokens')).toBeVisible();
+});
+
+it('shows upstream-only reasoning support and output separately for discovered candidates', async () => {
+  stubFetch(url => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([]);
+    if (url.endsWith('/model-candidates')) return Response.json({ source: 'upstream', catalogVersion: 'v2', models: [{ ...entry('unknown-native', '上游型号'), capabilities: { ...capabilities, known: false, efforts: [], reasoningSupported: true, outputSource: 'upstream', outputMax: 32768, contextWindow: 131072, sources: ['https://example.invalid/models'] } }] });
+    return undefined;
+  });
+  mount('/settings/providers/p1');
+  fireEvent.click(await screen.findByRole('button', { name: '拉取模型' }));
+  expect(await screen.findByText('支持思考 · 具体参数未核实')).toBeVisible();
+  expect(screen.getByText('模型最大输出 32,768 tokens')).toBeVisible();
+  expect(screen.getByText(/上下文 131,072 tokens/)).toBeVisible();
+  expect(screen.queryByRole('combobox', { name: '思考档位' })).not.toBeInTheDocument();
+});
+
+it('distinguishes explicitly unsupported reasoning from missing capability information', async () => {
+  stubFetch(url => {
+    if (url.endsWith('/providers')) return Response.json([providerA]);
+    if (url.endsWith('/models')) return Response.json([{ ...modelA, capabilities: { ...capabilities, known: false, reasoningSupported: false, efforts: [] } }]);
+    return undefined;
+  });
+  mount('/settings/models');
+  expect(await screen.findByText('不支持思考')).toBeVisible();
+  expect(screen.queryByText('思考能力未核实')).not.toBeInTheDocument();
 });

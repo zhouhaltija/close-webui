@@ -191,7 +191,7 @@ it('allows explicitly resetting stale native defaults before saving an unknown m
     if (url.endsWith('/models')) return Response.json([model]);
     return Response.json([]);
   });
-  mount('/settings/providers/p1'); fireEvent.click(await screen.findByRole('button', { name: '编辑能力变更模型的思考参数' }));
+  mount('/settings/providers/p1'); fireEvent.click(await screen.findByRole('button', { name: '能力变更模型的模型设置' }));
   expect(screen.getByRole('alert')).toHaveTextContent('尚未核实思考能力');
   expect(screen.getByRole('button', { name: '保存参数' })).toBeDisabled();
   expect(saved).toBeUndefined();

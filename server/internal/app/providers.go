@@ -1,7 +1,6 @@
 package app
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -27,10 +26,11 @@ type providerView struct {
 	BaseURL    string `json:"baseUrl"`
 	Enabled    bool   `json:"enabled"`
 	HasKey     bool   `json:"hasKey"`
+	UpdatedAt  string `json:"updatedAt"`
 }
 
 func providerDTO(p db.Provider) providerView {
-	return providerView{p.ID, p.Name, p.TemplateID, p.Protocol, p.Adapter, p.BaseUrl, p.Enabled, p.ApiKeyCiphertext != ""}
+	return providerView{p.ID, p.Name, p.TemplateID, p.Protocol, p.Adapter, p.BaseUrl, p.Enabled, p.ApiKeyCiphertext != "", p.UpdatedAt.UTC().Format(time.RFC3339Nano)}
 }
 func (a *App) listProviders(w http.ResponseWriter, r *http.Request) {
 	rows, err := a.queries.ListProviders(r.Context(), currentUser(r).ID)
@@ -186,19 +186,29 @@ func (a *App) discover(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	cfg, err := a.providerConfig(p)
+	_, err = a.providerConfig(p)
 	if err != nil {
 		failure(w, 400, "PROVIDER_UNAVAILABLE", err.Error())
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	models, err := a.upstream.Discover(ctx, cfg)
+	models, err := a.discoverAndRemember(r.Context(), p)
 	if err != nil {
 		failure(w, 502, "DISCOVERY_FAILED", "无法获取模型列表，可保留配置并手动添加模型。")
 		return
 	}
-	respond(w, 200, models)
+	// Preserve the legacy id/name array; metadata is published only through the
+	// candidate DTO and server-owned persistence.
+	legacy := make([]struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}, 0, len(models))
+	for _, m := range models {
+		legacy = append(legacy, struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}{m.ID, m.Name})
+	}
+	respond(w, 200, legacy)
 }
 
 type modelView struct {
@@ -219,7 +229,7 @@ func (a *App) modelDTO(r *http.Request, m db.Model) (modelView, error) {
 	}
 	var reasoning upstream.Reasoning
 	_ = json.Unmarshal(m.DefaultReasoning, &reasoning)
-	return modelView{m.ID, m.ProviderID, m.ModelID, m.Name, m.Enabled, m.MaxOutputTokens, reasoning, upstream.Capabilities(p.Adapter, p.Protocol, m.ModelID)}, nil
+	return modelView{m.ID, m.ProviderID, m.ModelID, m.Name, m.Enabled, m.MaxOutputTokens, reasoning, modelCapability(p, m)}, nil
 }
 func (a *App) model(r *http.Request, id string) (db.Model, error) {
 	return a.queries.GetModel(r.Context(), db.GetModelParams{ID: id, UserID: currentUser(r).ID})
@@ -303,7 +313,9 @@ func (a *App) saveModel(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	cap := upstream.Capabilities(p.Adapter, p.Protocol, m.ModelID)
+	metadata := a.metadataForModel(r.Context(), p, m)
+	m.DiscoveryMetadata = discoveryBytes(p, m.ModelID, metadata)
+	cap := upstream.CapabilitiesWithMetadata(p.Adapter, p.Protocol, m.ModelID, metadata)
 	var reasoning upstream.Reasoning
 	_ = json.Unmarshal(m.DefaultReasoning, &reasoning)
 	if m.MaxOutputTokens <= 0 || m.MaxOutputTokens > 262144 {
@@ -314,13 +326,9 @@ func (a *App) saveModel(w http.ResponseWriter, r *http.Request) {
 		failure(w, 400, "INVALID_REASONING", err.Error())
 		return
 	}
-	if id == "" {
-		m, err = a.queries.CreateModel(r.Context(), db.CreateModelParams{ID: m.ID, UserID: uid, ProviderID: m.ProviderID, ModelID: m.ModelID, Name: m.Name, Enabled: m.Enabled, MaxOutputTokens: m.MaxOutputTokens, DefaultReasoning: m.DefaultReasoning})
-	} else {
-		m, err = a.queries.UpdateModel(r.Context(), db.UpdateModelParams{ID: m.ID, UserID: uid, ProviderID: m.ProviderID, ModelID: m.ModelID, Name: m.Name, Enabled: m.Enabled, MaxOutputTokens: m.MaxOutputTokens, DefaultReasoning: m.DefaultReasoning})
-	}
+	m, err = a.saveValidatedModel(r.Context(), p, m, id == "")
 	if err != nil {
-		dbError(w, err)
+		generationError(w, err)
 		return
 	}
 	v, err := a.modelDTO(r, m)

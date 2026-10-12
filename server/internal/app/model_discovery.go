@@ -77,7 +77,7 @@ func candidateFor(p db.Provider, m upstream.DiscoveredModel) candidateModel {
 	if name == "" {
 		name = m.ID
 	}
-	capability := upstream.Capabilities(p.Adapter, p.Protocol, m.ID)
+	capability := upstream.CapabilitiesWithMetadata(p.Adapter, p.Protocol, m.ID, m.Metadata)
 	return candidateModel{ID: m.ID, Name: name, Capabilities: capability, RecommendedDefaults: recommendedDefaultsFor(capability), Notes: notes}
 }
 
@@ -152,14 +152,12 @@ func (a *App) modelCandidates(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
-	cfg, cfgErr := a.providerConfig(p)
+	_, cfgErr := a.providerConfig(p)
 	if cfgErr != nil {
 		respond(w, 200, modelCandidatesResponse{Source: "catalog", CatalogVersion: upstream.CatalogVersion(), Warning: cfgErr.Error() + "以下为内置候选。", Models: catalogCandidates(p)})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), modelDiscoveryTimeout)
-	defer cancel()
-	models, err := a.upstream.Discover(ctx, cfg)
+	models, err := a.discoverAndRemember(r.Context(), p)
 	if err != nil || len(models) == 0 {
 		warning := discoveryWarning(err, len(models))
 		if warning == "" {
@@ -246,7 +244,8 @@ func (a *App) batchOneModel(r *http.Request, p db.Provider, uid string, item bat
 	if !nonempty(name, 80) {
 		return fail("请填写有效的模型 ID 和名称。")
 	}
-	capability := upstream.Capabilities(p.Adapter, p.Protocol, modelID)
+	metadata := a.metadataForModel(r.Context(), p, db.Model{ProviderID: p.ID, ModelID: modelID})
+	capability := upstream.CapabilitiesWithMetadata(p.Adapter, p.Protocol, modelID, metadata)
 	reasoning := upstream.Reasoning{}
 	if item.DefaultReasoning != nil {
 		reasoning = *item.DefaultReasoning
@@ -277,8 +276,12 @@ func (a *App) batchOneModel(r *http.Request, p db.Provider, uid string, item bat
 	if err != nil {
 		return fail("思考参数无效。")
 	}
-	created, err := a.queries.CreateModel(r.Context(), db.CreateModelParams{ID: uuid.NewString(), UserID: uid, ProviderID: p.ID, ModelID: modelID, Name: name, Enabled: enabled, MaxOutputTokens: maxOutput, DefaultReasoning: reasoningBytes})
+	created, err := a.saveValidatedModel(r.Context(), p, db.Model{ID: uuid.NewString(), UserID: uid, ProviderID: p.ID, ModelID: modelID, Name: name, Enabled: enabled, MaxOutputTokens: maxOutput, DefaultReasoning: reasoningBytes, DiscoveryMetadata: discoveryBytes(p, modelID, metadata)}, true)
 	if err != nil {
+		var problem *requestError
+		if errors.As(err, &problem) {
+			return fail(problem.message)
+		}
 		return fail("保存模型失败，请稍后重试。")
 	}
 	return batchModelResult{ModelID: modelID, ID: created.ID, Status: "added"}

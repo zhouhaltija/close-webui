@@ -15,6 +15,8 @@ const subscribeViewport = (listener: () => void) => {
 export function reasoningSummary(reasoning: Reasoning): string {
   if (reasoning.enabled === false) return '关闭思考';
   if (reasoning.effort) return reasoningEffortLabels[reasoning.effort] || reasoning.effort;
+  if (reasoning.budgetTokens === -1) return '自动预算';
+  if (reasoning.budgetTokens === 0) return '关闭思考';
   if (reasoning.budgetTokens !== undefined) return `预算 ${reasoning.budgetTokens}`;
   return '默认';
 }

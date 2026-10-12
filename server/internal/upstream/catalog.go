@@ -152,6 +152,10 @@ func (c Capability) RecommendedOutputTokens() int {
 func cloneCapability(c Capability) Capability {
 	c.Efforts = slices.Clone(c.Efforts)
 	c.Sources = slices.Clone(c.Sources)
+	if c.ReasoningSupported != nil {
+		value := *c.ReasoningSupported
+		c.ReasoningSupported = &value
+	}
 	return c
 }
 

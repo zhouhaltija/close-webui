@@ -116,20 +116,12 @@ func (c *Client) Discover(ctx context.Context, p ProviderConfig) ([]DiscoveredMo
 			return nil, errors.New("上游模型列表超过大小限制")
 		}
 		var response struct {
-			Error json.RawMessage `json:"error"`
-			Data  []struct {
-				ID          string `json:"id"`
-				Name        string `json:"name"`
-				DisplayName string `json:"display_name"`
-			} `json:"data"`
-			Models []struct {
-				Name        string   `json:"name"`
-				DisplayName string   `json:"displayName"`
-				Methods     []string `json:"supportedGenerationMethods"`
-			} `json:"models"`
-			NextPageToken string `json:"nextPageToken"`
-			HasMore       bool   `json:"has_more"`
-			LastID        string `json:"last_id"`
+			Error         json.RawMessage   `json:"error"`
+			Data          []json.RawMessage `json:"data"`
+			Models        []json.RawMessage `json:"models"`
+			NextPageToken string            `json:"nextPageToken"`
+			HasMore       bool              `json:"has_more"`
+			LastID        string            `json:"last_id"`
 		}
 		if json.Unmarshal(data, &response) != nil {
 			return nil, errors.New("上游模型列表格式无效")
@@ -147,7 +139,15 @@ func (c *Client) Discover(ctx context.Context, p ProviderConfig) ([]DiscoveredMo
 			return nil, errors.New("上游模型列表格式无效")
 		}
 		if p.Protocol == "gemini" {
-			for _, v := range response.Models {
+			for _, raw := range response.Models {
+				var v struct {
+					Name        string   `json:"name"`
+					DisplayName string   `json:"displayName"`
+					Methods     []string `json:"supportedGenerationMethods"`
+				}
+				if json.Unmarshal(raw, &v) != nil {
+					return nil, errors.New("上游模型列表格式无效")
+				}
 				if len(v.Methods) > 0 && !contains(v.Methods, "generateContent") {
 					continue
 				}
@@ -157,13 +157,21 @@ func (c *Client) Discover(ctx context.Context, p ProviderConfig) ([]DiscoveredMo
 					if name == "" {
 						name = id
 					}
-					models = append(models, DiscoveredModel{id, name})
+					models = append(models, DiscoveredModel{ID: id, Name: name, Metadata: publicMetadata(p, raw)})
 					seen[id] = true
 				}
 			}
 			cursor = response.NextPageToken
 		} else {
-			for _, v := range response.Data {
+			for _, raw := range response.Data {
+				var v struct {
+					ID          string `json:"id"`
+					Name        string `json:"name"`
+					DisplayName string `json:"display_name"`
+				}
+				if json.Unmarshal(raw, &v) != nil {
+					return nil, errors.New("上游模型列表格式无效")
+				}
 				if v.ID != "" && !seen[v.ID] {
 					name := v.Name
 					if v.DisplayName != "" {
@@ -172,7 +180,7 @@ func (c *Client) Discover(ctx context.Context, p ProviderConfig) ([]DiscoveredMo
 					if name == "" {
 						name = v.ID
 					}
-					models = append(models, DiscoveredModel{v.ID, name})
+					models = append(models, DiscoveredModel{ID: v.ID, Name: name, Metadata: publicMetadata(p, raw)})
 					seen[v.ID] = true
 				}
 			}
@@ -242,7 +250,7 @@ func (c *Client) Stream(ctx context.Context, p ProviderConfig, m ModelConfig, hi
 	if m.ModelID == "" || len(m.ModelID) > 256 {
 		return nil, errors.New("模型标识无效")
 	}
-	prof := getProfile(p.Adapter, p.Protocol, m.ModelID)
+	prof := profileWithMetadata(p.Adapter, p.Protocol, m.ModelID, m.Metadata)
 	if m.MaxOutputTokens == 0 {
 		m.MaxOutputTokens = prof.capability.OutputMax
 	}

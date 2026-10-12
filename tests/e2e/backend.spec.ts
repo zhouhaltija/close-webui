@@ -37,7 +37,7 @@ async function configure(page: Page) {
   await expect(page.getByRole('status').filter({ hasText: '批量添加完成' })).toBeVisible({ timeout: 20000 });
   const row = page.locator('.model-row').filter({ hasText: 'gpt-5.1' });
   await expect(row).toBeVisible();
-  await row.getByRole('button', { name: '思考参数' }).click();
+  await row.getByRole('button', { name: /的模型设置$/ }).click();
   // The nested label's text also contains the option text; use the control's
   // accessible name, which excludes those options, rather than exact label text.
   const effort = row.getByRole('combobox', { name: '思考档位', exact: true });

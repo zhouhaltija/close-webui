@@ -156,10 +156,7 @@ func getProfile(adapter, protocol, id string) profile {
 	return profile{capability: Capability{Efforts: []string{}, Sources: []string{}, OutputMax: 4096}}
 }
 func Capabilities(adapter, protocol, modelID string) Capability {
-	c := getProfile(adapter, protocol, modelID).capability
-	c.Efforts = slices.Clone(c.Efforts)
-	c.Sources = slices.Clone(c.Sources)
-	return c
+	return CapabilitiesWithMetadata(adapter, protocol, modelID, nil)
 }
 
 func ValidateReasoning(c Capability, r Reasoning, maxOutput int) error {

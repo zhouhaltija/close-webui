@@ -46,19 +46,20 @@ type rateWindow struct {
 	attempts int
 }
 type App struct {
-	handler   http.Handler
-	cfg       Config
-	pool      *pgxpool.Pool
-	queries   *db.Queries
-	cipher    *security.Cipher
-	upstream  *upstream.Client
-	lease     *pgxpool.Conn
-	mu        sync.Mutex
-	closeOnce sync.Once
-	active    map[string]*running
-	rates     map[string]rateWindow
-	authSlots chan struct{}
-	dummyHash string
+	handler    http.Handler
+	cfg        Config
+	pool       *pgxpool.Pool
+	queries    *db.Queries
+	cipher     *security.Cipher
+	upstream   *upstream.Client
+	lease      *pgxpool.Conn
+	mu         sync.Mutex
+	closeOnce  sync.Once
+	active     map[string]*running
+	rates      map[string]rateWindow
+	authSlots  chan struct{}
+	dummyHash  string
+	discovered map[discoveryCacheKey]discoveryCache
 }
 
 func New(ctx context.Context, cfg Config) (*App, error) {

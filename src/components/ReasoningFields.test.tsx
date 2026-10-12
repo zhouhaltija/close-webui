@@ -29,10 +29,20 @@ it('rejects zero budgets with explicit enabled thinking and manual defaults with
   expect(reasoningError({ enabled: true, effort: 'none' }, capability, 4096)).not.toBe('');
   expect(reasoningError({ enabled: false, budgetTokens: 1024 }, capability, 4096)).not.toBe('');
 });
-it('describes special dynamic and disabled budget values in the numeric control', () => {
-  render(<ReasoningFields capabilities={{ ...capability, dynamicBudget: true, zeroBudgetDisables: true, budgetWithinOutput: false }} value={{}} output={2048} onChange={() => {}} />);
-  const input = screen.getByRole('spinbutton', { name: /思考预算/ }); expect(input).toHaveAttribute('min', '-1'); expect(input).toHaveAttribute('max', '8192');
-  expect(screen.getByText(/-1.*动态/)).toBeVisible(); expect(screen.getByText(/0.*关闭/)).toBeVisible();
+it('keeps native automatic and off sentinels out of the budget editor', () => {
+  function Editor() {
+    const [value, setValue] = useState<Reasoning>({});
+    return <ReasoningFields capabilities={{ ...capability, dynamicBudget: true, zeroBudgetDisables: true, budgetWithinOutput: false }} value={value} output={2048} onChange={setValue} />;
+  }
+  render(<Editor />);
+  const input = screen.getByRole('spinbutton', { name: /思考预算/ }); expect(input).toHaveAttribute('min', '128'); expect(input).toHaveAttribute('max', '8192');
+  expect(screen.queryByText(/-1/)).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('预算方式'), { target: { value: 'auto' } });
+  expect(screen.queryByRole('spinbutton', { name: /思考预算/ })).not.toBeInTheDocument();
+  expect(screen.getByText('由模型自动分配思考预算。')).toBeVisible();
+  fireEvent.change(screen.getByLabelText('预算方式'), { target: { value: 'off' } });
+  expect(screen.queryByRole('spinbutton', { name: /思考预算/ })).not.toBeInTheDocument();
+  expect(screen.getByText('此设置关闭模型的思考预算。')).toBeVisible();
 });
 it.each([true, false])('clears every native override only after explicit reset when capabilities are known=%s', known => {
   function Editor() {
@@ -44,4 +54,26 @@ it.each([true, false])('clears every native override only after explicit reset w
   fireEvent.click(screen.getByRole('button', { name: '重置为供应商默认' }));
   expect(screen.getByLabelText('当前参数')).toHaveTextContent('{}');
   expect(screen.queryByRole('button', { name: '重置为供应商默认' })).not.toBeInTheDocument();
+});
+
+it('offers semantic budget modes only when registered and keeps default absent', () => {
+  function Editor() {
+    const [value, setValue] = useState<Reasoning>({});
+    return <><ReasoningFields capabilities={{ ...capability, dynamicBudget: true, zeroBudgetDisables: true }} value={value} output={4096} onChange={setValue} /><output aria-label="当前参数">{JSON.stringify(value)}</output></>;
+  }
+  render(<Editor />);
+  const mode = screen.getByLabelText('预算方式');
+  fireEvent.change(mode, { target: { value: 'auto' } });
+  expect(screen.getByLabelText('当前参数')).toHaveTextContent('{"budgetTokens":-1}');
+  fireEvent.change(mode, { target: { value: 'off' } });
+  expect(screen.getByLabelText('当前参数')).toHaveTextContent('{"budgetTokens":0}');
+  fireEvent.change(mode, { target: { value: 'default' } });
+  expect(screen.getByLabelText('当前参数')).toHaveTextContent('{}');
+});
+
+it('does not offer automatic or disabled budget for a model without those capabilities', () => {
+  render(<ReasoningFields capabilities={capability} value={{}} output={4096} onChange={() => {}} />);
+  expect(screen.getByLabelText('预算方式')).toBeVisible();
+  expect(screen.queryByRole('option', { name: '自动分配' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('option', { name: '关闭预算' })).not.toBeInTheDocument();
 });

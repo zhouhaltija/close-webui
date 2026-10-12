@@ -34,18 +34,19 @@ func (q *Queries) CreateConversation(ctx context.Context, arg CreateConversation
 }
 
 const createModel = `-- name: CreateModel :one
-INSERT INTO models (id,user_id,provider_id,model_id,name,enabled,max_output_tokens,default_reasoning) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at
+INSERT INTO models (id,user_id,provider_id,model_id,name,enabled,max_output_tokens,default_reasoning,discovery_metadata) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,COALESCE($9::jsonb,'{}'::jsonb)) RETURNING id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at, discovery_metadata
 `
 
 type CreateModelParams struct {
-	ID               string `json:"id"`
-	UserID           string `json:"user_id"`
-	ProviderID       string `json:"provider_id"`
-	ModelID          string `json:"model_id"`
-	Name             string `json:"name"`
-	Enabled          bool   `json:"enabled"`
-	MaxOutputTokens  int32  `json:"max_output_tokens"`
-	DefaultReasoning []byte `json:"default_reasoning"`
+	ID                string `json:"id"`
+	UserID            string `json:"user_id"`
+	ProviderID        string `json:"provider_id"`
+	ModelID           string `json:"model_id"`
+	Name              string `json:"name"`
+	Enabled           bool   `json:"enabled"`
+	MaxOutputTokens   int32  `json:"max_output_tokens"`
+	DefaultReasoning  []byte `json:"default_reasoning"`
+	DiscoveryMetadata []byte `json:"discovery_metadata"`
 }
 
 func (q *Queries) CreateModel(ctx context.Context, arg CreateModelParams) (Model, error) {
@@ -58,6 +59,7 @@ func (q *Queries) CreateModel(ctx context.Context, arg CreateModelParams) (Model
 		arg.Enabled,
 		arg.MaxOutputTokens,
 		arg.DefaultReasoning,
+		arg.DiscoveryMetadata,
 	)
 	var i Model
 	err := row.Scan(
@@ -71,6 +73,7 @@ func (q *Queries) CreateModel(ctx context.Context, arg CreateModelParams) (Model
 		&i.DefaultReasoning,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DiscoveryMetadata,
 	)
 	return i, err
 }
@@ -249,7 +252,7 @@ func (q *Queries) GetConversation(ctx context.Context, arg GetConversationParams
 }
 
 const getModel = `-- name: GetModel :one
-SELECT id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at FROM models WHERE id=$1 AND user_id=$2
+SELECT id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at, discovery_metadata FROM models WHERE id=$1 AND user_id=$2
 `
 
 type GetModelParams struct {
@@ -271,6 +274,7 @@ func (q *Queries) GetModel(ctx context.Context, arg GetModelParams) (Model, erro
 		&i.DefaultReasoning,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DiscoveryMetadata,
 	)
 	return i, err
 }
@@ -437,7 +441,7 @@ func (q *Queries) ListMessages(ctx context.Context, arg ListMessagesParams) ([]M
 }
 
 const listModels = `-- name: ListModels :many
-SELECT id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at FROM models WHERE user_id=$1 ORDER BY created_at,id
+SELECT id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at, discovery_metadata FROM models WHERE user_id=$1 ORDER BY created_at,id
 `
 
 func (q *Queries) ListModels(ctx context.Context, userID string) ([]Model, error) {
@@ -460,6 +464,7 @@ func (q *Queries) ListModels(ctx context.Context, userID string) ([]Model, error
 			&i.DefaultReasoning,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DiscoveryMetadata,
 		); err != nil {
 			return nil, err
 		}
@@ -530,19 +535,35 @@ func (q *Queries) RenameConversation(ctx context.Context, arg RenameConversation
 	return i, err
 }
 
+const updateDiscoveredModelsMetadata = `-- name: UpdateDiscoveredModelsMetadata :exec
+UPDATE models SET discovery_metadata=records.metadata FROM jsonb_to_recordset($3::jsonb) AS records(model_id text, metadata jsonb) WHERE models.user_id=$1 AND models.provider_id=$2 AND models.model_id=records.model_id
+`
+
+type UpdateDiscoveredModelsMetadataParams struct {
+	UserID           string `json:"user_id"`
+	ProviderID       string `json:"provider_id"`
+	DiscoveryRecords []byte `json:"discovery_records"`
+}
+
+func (q *Queries) UpdateDiscoveredModelsMetadata(ctx context.Context, arg UpdateDiscoveredModelsMetadataParams) error {
+	_, err := q.db.Exec(ctx, updateDiscoveredModelsMetadata, arg.UserID, arg.ProviderID, arg.DiscoveryRecords)
+	return err
+}
+
 const updateModel = `-- name: UpdateModel :one
-UPDATE models SET provider_id=$3,model_id=$4,name=$5,enabled=$6,max_output_tokens=$7,default_reasoning=$8,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at
+UPDATE models SET provider_id=$3,model_id=$4,name=$5,enabled=$6,max_output_tokens=$7,default_reasoning=$8,discovery_metadata=COALESCE($9::jsonb,'{}'::jsonb),updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING id, user_id, provider_id, model_id, name, enabled, max_output_tokens, default_reasoning, created_at, updated_at, discovery_metadata
 `
 
 type UpdateModelParams struct {
-	ID               string `json:"id"`
-	UserID           string `json:"user_id"`
-	ProviderID       string `json:"provider_id"`
-	ModelID          string `json:"model_id"`
-	Name             string `json:"name"`
-	Enabled          bool   `json:"enabled"`
-	MaxOutputTokens  int32  `json:"max_output_tokens"`
-	DefaultReasoning []byte `json:"default_reasoning"`
+	ID                string `json:"id"`
+	UserID            string `json:"user_id"`
+	ProviderID        string `json:"provider_id"`
+	ModelID           string `json:"model_id"`
+	Name              string `json:"name"`
+	Enabled           bool   `json:"enabled"`
+	MaxOutputTokens   int32  `json:"max_output_tokens"`
+	DefaultReasoning  []byte `json:"default_reasoning"`
+	DiscoveryMetadata []byte `json:"discovery_metadata"`
 }
 
 func (q *Queries) UpdateModel(ctx context.Context, arg UpdateModelParams) (Model, error) {
@@ -555,6 +576,7 @@ func (q *Queries) UpdateModel(ctx context.Context, arg UpdateModelParams) (Model
 		arg.Enabled,
 		arg.MaxOutputTokens,
 		arg.DefaultReasoning,
+		arg.DiscoveryMetadata,
 	)
 	var i Model
 	err := row.Scan(
@@ -568,6 +590,7 @@ func (q *Queries) UpdateModel(ctx context.Context, arg UpdateModelParams) (Model
 		&i.DefaultReasoning,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DiscoveryMetadata,
 	)
 	return i, err
 }

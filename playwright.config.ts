@@ -9,8 +9,8 @@ export default defineConfig({
   globalTeardown: './tests/e2e/backend-cleanup.ts',
   use: { baseURL: 'http://localhost:4173', browserName: 'chromium', channel: process.env.PLAYWRIGHT_CHANNEL, trace: 'retain-on-failure' },
   projects: [
-    { name: 'mock', testIgnore: ['**/real-api.spec.ts', '**/backend.spec.ts', '**/responsiveness.spec.ts', '**/fixes.spec.ts', '**/performance.spec.ts'] },
-    { name: 'real-api', testMatch: ['**/real-api.spec.ts', '**/responsiveness.spec.ts'], use: { baseURL: 'http://localhost:4174' } },
+    { name: 'mock', testIgnore: ['**/real-api.spec.ts', '**/backend.spec.ts', '**/responsiveness.spec.ts', '**/provider-settings.spec.ts', '**/fixes.spec.ts', '**/performance.spec.ts'] },
+    { name: 'real-api', testMatch: ['**/real-api.spec.ts', '**/responsiveness.spec.ts', '**/provider-settings.spec.ts'], use: { baseURL: 'http://localhost:4174' } },
     { name: 'backend', testMatch: ['**/backend.spec.ts', '**/fixes.spec.ts', '**/performance.spec.ts'], use: { baseURL: 'http://127.0.0.1:4175' } },
   ],
   // The global pnpm launcher occasionally stalls on a network version check, which would
