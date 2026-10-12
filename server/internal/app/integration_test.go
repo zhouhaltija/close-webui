@@ -31,7 +31,8 @@ func fixture(t *testing.T, upstreamURL string) (*httptest.Server, string) {
 	if dsn == "" {
 		t.Skip("DATABASE_URL is required for PostgreSQL integration tests")
 	}
-	ctx := context.Background()
+	ctx, setupCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer setupCancel()
 	admin, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		t.Fatal("connect test database:", err)
@@ -196,6 +197,11 @@ func TestAccountsConfigurationAndOwnership(t *testing.T) {
 func TestGenerationPersistenceRetryStopAndCancellationIntent(t *testing.T) {
 	started, cancelled := make(chan struct{}, 4), make(chan struct{}, 4)
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":[{"id":"gpt-4o"}]}`)
+			return
+		}
 		var body struct {
 			Messages []struct {
 				Content string `json:"content"`

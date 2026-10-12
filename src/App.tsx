@@ -1,7 +1,7 @@
 import { Component, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
-import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { Link, useLocation, useNavigate, useParams, type NavigateFunction } from 'react-router-dom';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import * as Dialog from '@radix-ui/react-dialog';
 import * as AlertDialog from '@radix-ui/react-alert-dialog';
 import * as Dropdown from '@radix-ui/react-dropdown-menu';
@@ -31,6 +31,9 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { failed: 
 
 /** Route used while a brand-new conversation is still being created on the server. */
 export const PENDING_CONVERSATION = 'pending';
+// Route changes can unmount ChatApp while a submission still needs confirmation.
+// Retain its IDs only for this query client and authenticated page session.
+const generationSessions = new WeakMap<QueryClient, { ownerRevision: number; real: boolean; coordinator: GenerationCoordinator; navigation: { current: NavigateFunction } }>();
 
 function Recovery() {
   const warning = useRuntime(s => s.warning); const client = useQueryClient(); const navigate = useNavigate(); const [confirm, setConfirm] = useState(false);
@@ -40,7 +43,12 @@ function Recovery() {
 }
 
 export function App() {
-  const location = useLocation();
+  const location = useLocation(); const client = useQueryClient();
+  useEffect(() => {
+    const endSession = () => { generationSessions.get(client)?.coordinator.stop(); generationSessions.delete(client); };
+    window.addEventListener('closewebui:session-end', endSession);
+    return () => window.removeEventListener('closewebui:session-end', endSession);
+  }, [client]);
   if (import.meta.env.VITE_ENABLE_MOCK === 'false') return <AuthBoundary>{location.pathname.startsWith('/settings') ? <Settings /> : <ChatApp real />}</AuthBoundary>;
   return <ChatApp />;
 }
@@ -80,13 +88,21 @@ function ChatApp({ real = false }: { real?: boolean }) {
   };
   const [generation] = useState(() => {
     const ownerRevision = sessionRequestRevision();
-    return new GenerationCoordinator({ api, publish, busy: busy => useUI.setState({ busy }), error: error => { if (!real || ownerRevision === sessionRequestRevision()) useUI.setState({ error }); }, accepted: id => { useUI.getState().draft(id, ''); useUI.getState().draft('home', ''); useUI.getState().draft(PENDING_CONVERSATION, ''); }, navigate: id => { useUI.getState().draft(id, useUI.getState().drafts.home || ''); useUI.getState().draft(PENDING_CONVERSATION, ''); navigate(`/chat/${id}`); }, preview: value => useUI.setState({ preview: value }), load: id => client.getQueryData<Conversation>(['conversation', id]), terminate: runtime.terminate });
+    const previous = generationSessions.get(client);
+    if (previous && previous.ownerRevision === ownerRevision && previous.real === real) { previous.navigation.current = navigate; return previous.coordinator; }
+    const navigation = { current: navigate };
+    const owned = () => !real || ownerRevision === sessionRequestRevision();
+    const coordinator = new GenerationCoordinator({ api, publish: c => { if (owned()) publish(c); }, busy: busy => { if (owned()) useUI.setState({ busy }); }, error: error => { if (owned()) useUI.setState({ error }); }, accepted: (id, input) => {
+      if (!owned() || input.retry) return;
+      for (const key of [id, 'home', PENDING_CONVERSATION]) if (useUI.getState().drafts[key] === input.content) useUI.getState().draft(key, '');
+    }, navigate: id => { if (!owned()) return; useUI.getState().draft(id, useUI.getState().drafts.home || ''); useUI.getState().draft(PENDING_CONVERSATION, ''); navigation.current(`/chat/${id}`); }, preview: value => { if (owned()) useUI.setState({ preview: value }); }, load: id => client.getQueryData<Conversation>(['conversation', id]), terminate: runtime.terminate });
+    generationSessions.set(client, { ownerRevision, real, coordinator, navigation });
+    return coordinator;
   });
   // Leaving the local pending route is expected while the server conversation is still being
   // created, so only a confirmed navigation to a different conversation cancels the generation.
   useEffect(() => { const target = generation.conversationId ?? (ui.preview ? PENDING_CONVERSATION : undefined); if (generation.isActive && conversationId && conversationId !== PENDING_CONVERSATION && conversationId !== target) generation.stop(); useUI.setState({ mobileOpen: false }); }, [conversationId, location.pathname, generation, ui.preview]);
   useEffect(() => { const stop = () => generation.stop(); window.addEventListener('pagehide', stop); return () => { window.removeEventListener('pagehide', stop); generation.stop(); }; }, [generation]);
-  useEffect(() => { const stop = () => generation.stop(); window.addEventListener('closewebui:session-end', stop); return () => window.removeEventListener('closewebui:session-end', stop); }, [generation]);
   const scroll = useRef<HTMLDivElement>(null); const follow = useRef(true); const lastTop = useRef(0); const [away, setAway] = useState(false);
   useLayoutEffect(() => { follow.current = true; setAway(false); const el = scroll.current; if (el) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }, [conversationId]);
   useLayoutEffect(() => { const el = scroll.current; if (el && follow.current) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }, [detail.data]);
@@ -105,7 +121,7 @@ function ChatApp({ real = false }: { real?: boolean }) {
     if (!manage || saving) return; setSaving(true); setManageError('');
     try {
       if (manage.mode === 'rename') { const result = await api.rename(manage.conversation.id, title); client.setQueryData<Conversation>(['conversation', result.id], old => old ? { ...old, ...result } : old); await client.invalidateQueries({ queryKey: ['conversations'] }); }
-      else { if (generation.conversationId === manage.conversation.id) generation.stop(); await api.remove(manage.conversation.id); client.removeQueries({ queryKey: ['conversation', manage.conversation.id] }); await client.invalidateQueries({ queryKey: ['conversations'] }); if (conversationId === manage.conversation.id) go(); }
+      else { if (generation.conversationId === manage.conversation.id) generation.stop(); await api.remove(manage.conversation.id); generation.conversationRemoved(manage.conversation.id); client.removeQueries({ queryKey: ['conversation', manage.conversation.id] }); await client.invalidateQueries({ queryKey: ['conversations'] }); if (conversationId === manage.conversation.id) go(); }
       setManage(undefined);
     } catch (e) { setManageError(errorText(e)); } finally { setSaving(false); }
   };
@@ -122,16 +138,17 @@ function ChatApp({ real = false }: { real?: boolean }) {
   const draftId = conversationId && !pendingRoute ? conversationId : 'home'; const value = ui.drafts[draftId] || '';
   const c = detail.data ?? (ui.preview ? { id: ui.preview.conversationId ?? PENDING_CONVERSATION, title: ui.preview.title, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messages: ui.preview.messages } : undefined);
   const modelError = models.error || providers.error || preferences.error;
-  const composer = <><Composer value={value} onChange={v => ui.draft(draftId, v)} onSend={() => { follow.current = true; setAway(false); flushSync(() => { if (!conversationId) navigate(`/chat/${PENDING_CONVERSATION}`, { replace: true }); void generation.send(value, conversationId === PENDING_CONVERSATION ? undefined : conversationId, undefined, real && selected ? { modelId: selected.id, reasoning } : undefined); }); }} onStop={() => { const created = !!generation.conversationId; generation.stop(); if (!created) navigate('/', { replace: true }); }} busy={ui.busy} disabled={!!conversationId && !pendingRoute && (!c || detail.isError)} sendDisabled={real && (!selected || !!parameterError || !!modelError || preferences.isPending)} home={!conversationId && !pendingRoute} modelSelector={real ? <RealModelSelector models={availableModels} selected={selected} reasoning={reasoning} /> : undefined} />{real && modelError && <p className="submit-error" role="alert">{errorText(modelError)}<button className="text-button" onClick={() => { void models.refetch(); void providers.refetch(); void preferences.refetch(); }}>重新加载模型配置</button></p>}{real && parameterError && <p className="submit-error" role="alert">{parameterError}</p>}</>;
+  const composer = <><Composer value={value} onChange={v => ui.draft(draftId, v)} onSend={() => { follow.current = true; setAway(false); flushSync(() => { if (!conversationId) navigate(`/chat/${PENDING_CONVERSATION}`, { replace: true }); void generation.send(value, conversationId === PENDING_CONVERSATION ? undefined : conversationId, undefined, real && selected ? { modelId: selected.id, reasoning } : undefined); }); }} onStop={() => { const created = !!generation.conversationId; generation.stop(); if (!created) navigate('/', { replace: true }); }} busy={ui.busy} disabled={!!conversationId && !pendingRoute && (!c || detail.isError)} sendDisabled={generation.hasUncertainSubmission || (real && (!selected || !!parameterError || !!modelError || preferences.isPending))} home={!conversationId && !pendingRoute} modelSelector={real ? <RealModelSelector models={availableModels} selected={selected} reasoning={reasoning} /> : undefined} />{real && modelError && <p className="submit-error" role="alert">{errorText(modelError)}<button className="text-button" onClick={() => { void models.refetch(); void providers.refetch(); void preferences.refetch(); }}>重新加载模型配置</button></p>}{real && parameterError && <p className="submit-error" role="alert">{parameterError}</p>}</>;
+  const submissionError = (ui.error || generation.hasUncertainSubmission) && <p className="submit-error" role="alert">{ui.error || '提交结果尚未确认，请核对后再发送。'}{generation.hasUncertainSubmission && <button className="text-button" disabled={ui.busy} onClick={() => { void generation.reconcile(); }}>核对提交状态</button>}</p>;
   return <Tooltip.Provider delayDuration={250}><div className={`app-shell ${ui.collapsed ? 'sidebar-collapsed' : ''}`}>
     <aside className="desktop-sidebar">{sidebar()}</aside>
     <Dialog.Root open={ui.mobileOpen} onOpenChange={mobileOpen => useUI.setState({ mobileOpen })}><Dialog.Trigger asChild><button className="mobile-menu icon-button" aria-label="打开侧栏"><Menu size={21} /></button></Dialog.Trigger><Dialog.Portal><Dialog.Overlay className="overlay drawer-overlay" /><Dialog.Content className="mobile-drawer"><Dialog.Title className="sr-only">对话导航</Dialog.Title><Dialog.Description className="sr-only">新建对话，查看和管理历史记录</Dialog.Description>{sidebar(true)}</Dialog.Content></Dialog.Portal></Dialog.Root>
     <main className={`workspace ${conversationId && !pendingRoute ? 'chat-workspace' : 'home-workspace'}`}>{(conversationId || ui.preview) && <header className="topbar"><h1>{c?.title || '对话'}</h1></header>}
       {warning && <div className="storage-warning" role="alert">{warning}</div>}
-      {!conversationId ? <section className="home-view"><div className="home-inner"><div className="welcome"><Mark large /><h2>{greeting}</h2></div>{composer}{ui.error && <p className="submit-error" role="alert">{ui.error}</p>}</div></section> : <>
+      {!conversationId ? <section className="home-view"><div className="home-inner"><div className="welcome"><Mark large /><h2>{greeting}</h2></div>{composer}{submissionError}</div></section> : <>
         <div className="conversation-scroll" ref={scroll} onScroll={() => { const el = scroll.current; if (!el) return; if (el.scrollTop < lastTop.current - 2) follow.current = false; if (el.scrollHeight - el.clientHeight - el.scrollTop <= 80) follow.current = true; lastTop.current = el.scrollTop; setAway(!follow.current); }}>
-          <div className="conversation-content">{detail.isPending && detail.fetchStatus !== 'idle' ? <p className="loading-state" role="status">正在加载对话…</p> : detail.isError ? <div className="empty-detail"><h2>{detail.error instanceof ApiError && detail.error.status === 404 ? '对话不存在' : '无法加载对话'}</h2><p>{errorText(detail.error)}</p>{detail.error instanceof ApiError && detail.error.status === 404 ? <button className="secondary-button" onClick={() => go()}>返回新对话</button> : <button className="secondary-button" onClick={() => void detail.refetch()}>重试</button>}</div> : c?.messages.length ? c.messages.map((m, i) => <MessageView key={m.id} message={m} canRetry={m.status === 'failed' && i === c.messages.length - 1 && !ui.busy} onRetry={() => { const user = c.messages[i - 1]; if (user) { follow.current = true; void generation.send(user.content, c.id, { content: user.content, userMessageId: user.id, assistantMessageId: m.id, retry: true, ...(real ? { modelId: m.modelId, reasoning: m.reasoning } : {}) }); } }} />) : <div className="empty-detail"><Mark large /><h2>给这个对话一个起点</h2><p>在下方写下你的想法。</p></div>}</div>
-        </div><div className="conversation-bottom">{away && <button className="back-bottom" onClick={() => { follow.current = true; setAway(false); const el = scroll.current; if (el) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }}><ArrowDown size={15} />回到底部</button>}{ui.error && <p className="submit-error" role="alert">{ui.error}</p>}{composer}<p className="chat-footnote">回答可能有误，请核实重要信息。</p></div>
+          <div className="conversation-content">{detail.isPending && detail.fetchStatus !== 'idle' ? <p className="loading-state" role="status">正在加载对话…</p> : detail.isError ? <div className="empty-detail"><h2>{detail.error instanceof ApiError && detail.error.status === 404 ? '对话不存在' : '无法加载对话'}</h2><p>{errorText(detail.error)}</p>{detail.error instanceof ApiError && detail.error.status === 404 ? <button className="secondary-button" onClick={() => go()}>返回新对话</button> : <button className="secondary-button" onClick={() => void detail.refetch()}>重试</button>}</div> : c?.messages.length ? c.messages.map((m, i) => <MessageView key={m.id} message={m} canRetry={m.status === 'failed' && i === c.messages.length - 1 && !ui.busy && !generation.hasUncertainSubmission} onRetry={() => { const user = c.messages[i - 1]; if (user) { follow.current = true; void generation.send(user.content, c.id, { content: user.content, userMessageId: user.id, assistantMessageId: m.id, retry: true, ...(real ? { modelId: m.modelId, reasoning: m.reasoning } : {}) }); } }} />) : <div className="empty-detail"><Mark large /><h2>给这个对话一个起点</h2><p>在下方写下你的想法。</p></div>}</div>
+        </div><div className="conversation-bottom">{away && <button className="back-bottom" onClick={() => { follow.current = true; setAway(false); const el = scroll.current; if (el) { el.scrollTop = el.scrollHeight; lastTop.current = el.scrollTop; } }}><ArrowDown size={15} />回到底部</button>}{submissionError}{composer}<p className="chat-footnote">回答可能有误，请核实重要信息。</p></div>
       </>}
     </main>
     <Dialog.Root open={manage?.mode === 'rename'} onOpenChange={open => { if (!open && !saving) setManage(undefined); }}><Dialog.Portal><Dialog.Overlay className="overlay" /><Dialog.Content className="modal" onCloseAutoFocus={restoreFocus}><Dialog.Title>重命名对话</Dialog.Title><Dialog.Description>给这个对话起一个容易找到的名字。</Dialog.Description><form onSubmit={e => { e.preventDefault(); void submitManage(); }}><label className="input-label" htmlFor="conversation-title">对话标题</label><input id="conversation-title" value={title} onChange={e => setTitle(e.target.value)} autoFocus disabled={saving} />{manageError && <p className="submit-error" role="alert">{manageError}</p>}<div className="modal-actions"><Dialog.Close asChild><button type="button" className="secondary-button" disabled={saving}>取消</button></Dialog.Close><button type="submit" className="primary-button" disabled={saving}>{saving ? '保存中…' : '保存标题'}</button></div></form></Dialog.Content></Dialog.Portal></Dialog.Root>

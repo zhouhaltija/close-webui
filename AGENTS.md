@@ -59,6 +59,8 @@ pnpm server:build    # 构建真实前端 dist 及 .cache/bin 中的服务二进
 
 完整 E2E 增加 4175 真实 Go 模式：启动本地仿真上游、独立 `closewebui_e2e_<随机ID>` schema 和 `.test-dist/backend`；结束经测试专用关闭入口等待 schema 清理。Go 数据库测试也使用独立随机 schema；不得对 public 或用户数据库做测试回滚。此测试入口只存在于 `cmd/testserver`，生产服务不包含。实网供应商尚无密钥，不能把仿真成功表达为真实调用已经通过。
 
+`server:test` 的套件超时为 25 分钟，保留全部断言；远端数据库往返较高时完整套件可能超过 Go 默认 10 分钟。测试夹具初始化另外使用 90 秒超时。性能测试单独串行运行，不与数据库 suite/E2E 同时执行：`RUN_PERFORMANCE=1` 启用 `TestGenerationStagePerformance`，每协议预热一次并采样 30 次；`PERF_IMPLEMENTATION` 标注当前或实际 Git 基线，`PERF_OUTPUT_DIR` 指向忽略的测试产物目录。不得用重构的近似旧实现代替基线，不把网络写入计数称为数据包计数。浏览器生产预览测量增量接收到 DOM 的延迟；单独的 React profiling 构建才能报告纯渲染耗时和实际消息函数执行数，必须注明 profiling 开销且不把钩子加入正常产品构建。测试专用性能时点接口只在 `cmd/testserver` 中存在，记录虚构样本的标识与时间，不记录正文或凭据。
+
 首次 E2E 前运行 `pnpm exec playwright install chromium`。本机已安装 Chrome，可使用：
 
 ```powershell

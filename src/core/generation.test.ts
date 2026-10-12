@@ -1,7 +1,8 @@
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import type { ChatApi } from './api';
 import type { Conversation, GenerationInput, Message } from './types';
 import { GenerationCoordinator, type GenerationDependencies, type SubmissionPreview } from './generation';
+import { ApiError } from './errors';
 
 function harness() {
   let c: Conversation = { id: 'chat', title: '测试', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] };
@@ -20,6 +21,139 @@ function harness() {
 const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 const previewMessages = (h: ReturnType<typeof harness>) => h.previews.filter(Boolean).at(-1)!.messages;
 
+it('rolls back a rejected unsaved pair before loading the cache for another send', async () => {
+  const h = harness(); let cached: Conversation = { id: 'chat', title: '已保存', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] };
+  h.deps.load = () => cached; h.deps.publish = c => { cached = c; h.published.push(c); };
+  const generate = h.api.generate;
+  h.api.generate = async () => { throw new ApiError('MODEL_DISABLED', '模型已停用。', 400); };
+  const g = new GenerationCoordinator(h.deps); expect(await g.send('未保存问题', 'chat')).toBe(false);
+  expect(cached.messages).toEqual([]); expect(h.previews.at(-1)).toBeUndefined();
+  h.api.generate = generate;
+  const second = g.send('第二个问题', 'chat'); await flush();
+  expect(cached.messages.map(m => m.content)).toEqual(['第二个问题', '']);
+  h.event({ type: 'done', assistantMessageId: cached.messages[1].id }); await second;
+  expect(cached.messages).toHaveLength(2);
+});
+
+it.each(['pending', 'streaming'] as const)('confirms cancellation when uncertain submission reconciliation finds a %s answer', async status => {
+  const h = harness(); let submitted!: GenerationInput; let cancelled = false; const stopped: string[][] = [];
+  h.api.generate = async (_id, input) => { submitted = input; throw new ApiError('NETWORK_ERROR', '连接断开。', 0); };
+  h.api.get = async () => ({ id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: submitted ? [
+    { id: submitted.userMessageId, conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: '2026-10-10T00:00:00Z' },
+    { id: submitted.assistantMessageId, conversationId: 'chat', role: 'assistant', content: '已保存', status: cancelled ? 'stopped' : status, generationId: submitted.generationId, createdAt: '2026-10-10T00:00:00Z' },
+  ] : [] });
+  h.api.stop = async (id, generationId) => { stopped.push([id, generationId]); cancelled = true; };
+  const g = new GenerationCoordinator(h.deps); await g.send('问题', 'chat', undefined, { modelId: 'm1' });
+  expect(stopped).toEqual([['chat', submitted.generationId]]);
+  expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'stopped', content: '已保存' });
+  expect(g.hasUncertainSubmission).toBe(false);
+});
+
+it('blocks ordinary resend until an offline uncertain submission can be reconciled by its original IDs', async () => {
+  const h = harness(); let submitted!: GenerationInput;
+  h.api.generate = async (_id, input) => { submitted = input; throw new ApiError('NETWORK_ERROR', '连接断开。', 0); };
+  h.api.stop = async () => { throw new Error('仍然离线。'); };
+  const g = new GenerationCoordinator(h.deps); h.deps.load = () => ({ id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] });
+  h.api.get = async () => { throw new Error('仍然离线。'); };
+  await g.send('问题', 'chat', undefined, { modelId: 'm1' });
+  expect(g.hasUncertainSubmission).toBe(true);
+  expect(await g.send('问题', 'chat')).toBe(false);
+  expect(h.accepted).toEqual([]);
+  h.api.get = async () => ({ id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [
+    { id: submitted.userMessageId, conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: '2026-10-10T00:00:00Z' },
+    { id: submitted.assistantMessageId, conversationId: 'chat', role: 'assistant', content: '最终保存', status: 'completed', generationId: submitted.generationId, createdAt: '2026-10-10T00:00:00Z' },
+  ] });
+  expect(await g.reconcile()).toBe(true);
+  expect(g.hasUncertainSubmission).toBe(false);
+  expect(h.published.at(-1)!.messages.map(m => m.content)).toEqual(['问题', '最终保存']);
+  expect(h.accepted).toEqual(['chat']);
+});
+
+it('does not trust a missing pair read before cancellation when the confirming read fails', async () => {
+  const h = harness(); let reads = 0;
+  h.deps.load = () => ({ id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] });
+  h.api.generate = async () => { throw new ApiError('NETWORK_ERROR', '连接断开。', 0); };
+  h.api.get = async () => { if (++reads > 1) throw new Error('确认读取失败。'); return h.deps.load!('chat')!; };
+  h.api.stop = async () => {};
+  const g = new GenerationCoordinator(h.deps); await g.send('问题', 'chat', undefined, { modelId: 'm1' });
+  expect(g.hasUncertainSubmission).toBe(true);
+  expect(await g.send('问题', 'chat')).toBe(false);
+  expect(h.accepted).toEqual([]);
+});
+
+it('does not accept the previous generation snapshot as confirmation of an uncertain retry', async () => {
+  const h = harness(); let submitted!: GenerationInput; const cancelled: string[] = [];
+  const previous: Conversation = { id: 'chat', title: '重试', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [
+    { id: 'user', conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: '2026-10-10T00:00:00Z' },
+    { id: 'answer', conversationId: 'chat', role: 'assistant', content: '原失败正文', status: 'failed', generationId: 'previous-generation', modelId: 'm1', createdAt: '2026-10-10T00:00:00Z' },
+  ] };
+  h.deps.load = () => previous; h.api.get = async () => previous;
+  h.api.generate = async (_id, input) => { submitted = input; throw new ApiError('NETWORK_ERROR', '连接断开。', 0); };
+  h.api.stop = async (_id, generationId) => { cancelled.push(generationId); };
+  const g = new GenerationCoordinator(h.deps);
+  await g.send('问题', 'chat', { userMessageId: 'user', assistantMessageId: 'answer', content: '问题', retry: true, modelId: 'm1' });
+  expect(cancelled).toEqual([submitted.generationId]);
+  expect(h.accepted).toEqual([]);
+  expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'failed', content: '原失败正文', generationId: 'previous-generation' });
+  expect(g.hasUncertainSubmission).toBe(false);
+});
+
+it('does not publish a late manual reconciliation after stopping it', async () => {
+  const h = harness(); let submitted!: GenerationInput; let resolveRead!: (snapshot: Conversation) => void;
+  const saved: Conversation = { id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] };
+  h.deps.load = () => saved;
+  h.api.generate = async (_id, input) => { submitted = input; throw new ApiError('NETWORK_ERROR', '离线。', 0); };
+  h.api.get = async () => { throw new Error('离线。'); }; h.api.stop = async () => { throw new Error('离线。'); };
+  const g = new GenerationCoordinator(h.deps); await g.send('问题', 'chat', undefined, { modelId: 'm1' });
+  h.api.get = () => new Promise(resolve => { resolveRead = resolve; });
+  const reconciliation = g.reconcile(); g.stop(); const count = h.published.length;
+  resolveRead({ ...saved, messages: [
+    { id: submitted.userMessageId, conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: saved.createdAt },
+    { id: submitted.assistantMessageId, conversationId: 'chat', role: 'assistant', content: '迟到终态', status: 'completed', generationId: submitted.generationId, createdAt: saved.createdAt },
+  ] });
+  await reconciliation;
+  expect(h.published).toHaveLength(count);
+  expect(g.hasUncertainSubmission).toBe(true);
+  expect(await g.send('问题', 'chat')).toBe(false);
+});
+
+it('a stopped reconciliation cannot settle or release a newer reconciliation attempt', async () => {
+  const h = harness(); let submitted!: GenerationInput; const reads: ((snapshot: Conversation) => void)[] = [];
+  const saved: Conversation = { id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] };
+  h.deps.load = () => saved;
+  h.api.generate = async (_id, input) => { submitted = input; throw new ApiError('NETWORK_ERROR', '离线。', 0); };
+  h.api.get = async () => { throw new Error('离线。'); }; h.api.stop = async () => { throw new Error('离线。'); };
+  const g = new GenerationCoordinator(h.deps); await g.send('问题', 'chat', undefined, { modelId: 'm1' });
+  h.api.get = () => new Promise(resolve => { reads.push(resolve); });
+  const first = g.reconcile(); g.stop(); const second = g.reconcile(); const count = h.published.length;
+  const snapshot: Conversation = { ...saved, messages: [
+    { id: submitted.userMessageId, conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: saved.createdAt },
+    { id: submitted.assistantMessageId, conversationId: 'chat', role: 'assistant', content: '权威终态', status: 'completed', generationId: submitted.generationId, createdAt: saved.createdAt },
+  ] };
+  reads[0](snapshot); await first;
+  expect(h.published).toHaveLength(count); expect(g.isActive).toBe(true); expect(h.busy.at(-1)).toBe(true);
+  reads[1](snapshot); expect(await second).toBe(true);
+  expect(h.published.at(-1)!.messages[1].content).toBe('权威终态'); expect(g.hasUncertainSubmission).toBe(false);
+});
+
+it('a cancelled first reconciliation read cannot settle a later manual reconciliation', async () => {
+  const h = harness(); let submitted!: GenerationInput; const reads: ((snapshot: Conversation) => void)[] = [];
+  const saved: Conversation = { id: 'chat', title: '问题', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] };
+  h.deps.load = () => saved; h.api.get = () => new Promise(resolve => { reads.push(resolve); });
+  h.api.generate = async (_id, input) => { submitted = input; throw new ApiError('NETWORK_ERROR', '离线。', 0); };
+  h.api.stop = async () => { throw new Error('离线。'); };
+  const g = new GenerationCoordinator(h.deps); const original = g.send('问题', 'chat', undefined, { modelId: 'm1' }); await flush();
+  g.stop(); const manual = g.reconcile(); const count = h.published.length;
+  const snapshot: Conversation = { ...saved, messages: [
+    { id: submitted.userMessageId, conversationId: 'chat', role: 'user', content: '问题', status: 'completed', createdAt: saved.createdAt },
+    { id: submitted.assistantMessageId, conversationId: 'chat', role: 'assistant', content: '权威终态', status: 'completed', generationId: submitted.generationId, createdAt: saved.createdAt },
+  ] };
+  reads[0](snapshot); await original;
+  expect(h.published).toHaveLength(count); expect(g.isActive).toBe(true); expect(h.busy.at(-1)).toBe(true);
+  reads[1](snapshot); expect(await manual).toBe(true);
+  expect(h.published.at(-1)!.messages[1].content).toBe('权威终态');
+});
+
 it('locks before creating, publishes one user message and completes streamed output', async () => {
   const h = harness(); const g = new GenerationCoordinator(h.deps); const pending = g.send('你好'); expect(await g.send('重复')).toBe(false); await flush();
   expect(h.creates()).toBe(1); expect(h.navigated).toEqual(['chat']); expect(h.accepted).toEqual(['chat']);
@@ -34,7 +168,7 @@ it('stops before the first delta, retains the answer and releases the slot', asy
 });
 
 it('keeps pre-acceptance errors separate from submitted messages', async () => {
-  const h = harness(); h.api.generate = async () => { throw new Error('提交失败'); }; const g = new GenerationCoordinator(h.deps); await g.send('你好');
+  const h = harness(); h.api.generate = async () => { throw new ApiError('REJECTED', '提交失败', 400); }; const g = new GenerationCoordinator(h.deps); await g.send('你好');
   expect(h.accepted).toEqual([]); expect(h.errors.at(-1)).toBe('提交失败'); expect(h.busy.at(-1)).toBe(false);
 });
 
@@ -99,6 +233,8 @@ it('sends an explicit stop before the generation response is accepted', async ()
 
 it('shows the submitted message and a submitting placeholder before the conversation exists', async () => {
   const h = harness(); let resolveCreate!: (c: Conversation) => void; h.api.create = () => new Promise<Conversation>(done => { resolveCreate = done; });
+  const generate = h.api.generate; let acceptSubmission!: () => void;
+  h.api.generate = (id, input, signal) => new Promise(resolve => { acceptSubmission = () => { void generate(id, input, signal).then(resolve); }; });
   const g = new GenerationCoordinator(h.deps); const pending = g.send('你好');
   expect(h.previews.at(-1)).toMatchObject({ conversationId: undefined, phase: 'submitting' });
   expect(previewMessages(h).map(m => [m.role, m.content, m.status, m.phase])).toEqual([['user', '你好', 'completed', undefined], ['assistant', '', 'pending', 'submitting']]);
@@ -107,10 +243,61 @@ it('shows the submitted message and a submitting placeholder before the conversa
   await flush();
   expect(h.navigated).toEqual(['new-chat']);
   expect(h.published.at(-1)!.messages.map(m => [m.role, m.id])).toEqual([['user', previewMessages(h)[0].id], ['assistant', previewMessages(h)[1].id]]);
+  expect(h.previews.at(-1)).toMatchObject({ conversationId: 'new-chat', phase: 'submitting' });
+  expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'pending', phase: 'submitting' });
+  expect(h.accepted).toEqual([]);
+  acceptSubmission(); await flush();
   expect(h.previews.at(-1)).toMatchObject({ conversationId: 'new-chat', phase: 'awaiting' });
+  expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'pending', phase: 'awaiting' });
   h.close(); await pending;
   expect(h.published.filter(c => c.messages.filter(m => m.role === 'user').length > 1).length).toBe(0);
   expect(h.previews.at(-1)).toBeUndefined();
+});
+
+function controlledFrames() {
+  let nextId = 0;
+  const pending = new Map<number, FrameRequestCallback>();
+  vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { const id = ++nextId; pending.set(id, callback); return id; });
+  vi.stubGlobal('cancelAnimationFrame', (id: number) => { pending.delete(id); });
+  return pending;
+}
+
+it('publishes a burst of deltas once per frame and flushes completion without another frame', async () => {
+  const frames = controlledFrames();
+  try {
+    const h = harness(); const g = new GenerationCoordinator(h.deps); const pending = g.send('问题'); await flush();
+    const before = h.published.at(-1)!; const count = h.published.length; const assistantId = before.messages[1].id;
+    for (const content of ['甲', '乙', '丙']) h.event({ type: 'delta', assistantMessageId: assistantId, content });
+    await flush();
+    expect(h.published).toHaveLength(count);
+    expect(frames.size).toBe(1);
+    const [handle, paint] = frames.entries().next().value!; frames.delete(handle); paint(16);
+    expect(h.published).toHaveLength(count + 1);
+    expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'streaming', content: '甲乙丙' });
+    expect(h.published.at(-1)!.messages[0]).toBe(before.messages[0]);
+    h.event({ type: 'delta', assistantMessageId: assistantId, content: '丁' });
+    h.event({ type: 'done', assistantMessageId: assistantId }); await pending;
+    expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'completed', content: '甲乙丙丁' });
+    expect(frames.size).toBe(0);
+  } finally { vi.unstubAllGlobals(); }
+});
+
+it('cancels an unpublished frame on stop and ignores its late callback', async () => {
+  const frames = controlledFrames();
+  try {
+    const h = harness(); const g = new GenerationCoordinator(h.deps); const pending = g.send('问题'); await flush();
+    const assistantId = h.published.at(-1)!.messages[1].id;
+    h.event({ type: 'delta', assistantMessageId: assistantId, content: '已确认正文' }); await flush();
+    expect(frames.size).toBe(1);
+    const paint = frames.values().next().value!;
+    g.stop(); const count = h.published.length;
+    expect(frames.size).toBe(0);
+    expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'stopped', content: '已确认正文' });
+    paint(16); await pending;
+    expect(h.published).toHaveLength(count);
+    expect(h.previews.at(-1)).toBeUndefined();
+    expect(g.isActive).toBe(false);
+  } finally { vi.unstubAllGlobals(); }
 });
 
 it('marks the placeholder as awaiting the model once the submission is accepted', async () => {
@@ -123,12 +310,12 @@ it('marks the placeholder as awaiting the model once the submission is accepted'
   expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'completed', content: '第', phase: undefined });
 });
 
-it('restores the draft and keeps the placeholder failed when the submission is rejected', async () => {
-  const h = harness(); h.api.generate = async () => { throw new Error('模型已停用'); }; const g = new GenerationCoordinator(h.deps); await g.send('你好');
+it('keeps a rejected submission out of saved messages and removes its temporary retry placeholder', async () => {
+  const h = harness(); h.api.generate = async () => { throw new ApiError('MODEL_DISABLED', '模型已停用', 400); }; const g = new GenerationCoordinator(h.deps); await g.send('你好');
   expect(h.errors.at(-1)).toBe('模型已停用');
-  const messages = previewMessages(h);
-  expect(messages[1]).toMatchObject({ status: 'failed', error: { message: '模型已停用' } });
-  expect(messages[0]).toMatchObject({ role: 'user', content: '你好' });
+  expect(h.previews.at(-1)).toBeUndefined();
+  expect(h.published.at(-1)!.messages).toEqual([]);
+  expect(h.accepted).toEqual([]);
 });
 
 it('reconciles an uncertain submission against the stored conversation instead of duplicating it', async () => {

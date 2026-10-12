@@ -35,7 +35,7 @@ func TestAnthropicDiscoveryControlsReachGenerationAndSnapshotRetry(t *testing.T)
 			return
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"content\":[]}}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+		_, _ = io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"content\":[]}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"快照重试正文\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
 	defer up.Close()
 	s, _ := fixture(t, up.URL)
@@ -55,6 +55,9 @@ func TestAnthropicDiscoveryControlsReachGenerationAndSnapshotRetry(t *testing.T)
 	retried := call(t, c, s.URL, "POST", "/conversations/"+cid+"/generations", input, 200)
 	if !strings.Contains(string(retried), `"type":"done"`) {
 		t.Fatalf("snapshot retry lost original metadata: %s", retried)
+	}
+	if !strings.Contains(string(retried), "快照重试正文") {
+		t.Fatal("snapshot retry did not deliver upstream text")
 	}
 	if len(payloads) != 2 {
 		t.Fatalf("upstream attempts=%d", len(payloads))

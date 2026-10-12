@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"closewebui/server/internal/db"
@@ -33,6 +34,28 @@ const (
 	// streamBatchLimit bounds the writer's own merge buffer between writes.
 	streamBatchLimit = 256 << 10
 )
+
+// Byte consumption is recorded separately; the channel is only a coalesced wake
+// signal. A paused request loop must recover every byte even if hundreds of
+// writer releases occur before it reads one notification.
+type streamCreditLedger struct {
+	ready    chan struct{}
+	consumed atomic.Int64
+}
+
+func newStreamCreditLedger() *streamCreditLedger {
+	return &streamCreditLedger{ready: make(chan struct{}, 1)}
+}
+func (c *streamCreditLedger) release(n int) {
+	c.consumed.Add(int64(n))
+	select {
+	case c.ready <- struct{}{}:
+	default:
+	}
+}
+func (c *streamCreditLedger) take() int {
+	return int(c.consumed.Swap(0))
+}
 
 type generationInput struct {
 	UserMessageID      string              `json:"userMessageId"`
@@ -392,7 +415,7 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	queue := make(chan streamUpdate, streamQueueItems)
-	credits := make(chan int, streamQueueItems)
+	credits := newStreamCreditLedger()
 	writeErr := make(chan error, 1)
 	writerExited := make(chan struct{})
 	go func() {
@@ -410,15 +433,6 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 		fail := func(err error) {
 			select {
 			case writeErr <- err:
-			default:
-			}
-		}
-		// releaseCredit reports consumed bytes back to the request loop. The send
-		// is non-blocking so a loop that is no longer draining credits (for
-		// example while it finalizes) can never wedge the writer.
-		releaseCredit := func(n int) {
-			select {
-			case credits <- n:
 			default:
 			}
 		}
@@ -442,7 +456,7 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 					if !ok {
 						return
 					}
-					releaseCredit(len(update.text))
+					credits.release(len(update.text))
 					batch = append(batch, update.text...)
 					timer = time.NewTimer(streamMergeWindow)
 					window = timer.C
@@ -457,7 +471,7 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 					}
 					return
 				}
-				releaseCredit(len(update.text))
+				credits.release(len(update.text))
 				batch = append(batch, update.text...)
 				if len(batch) >= streamBatchLimit {
 					stopWindow()
@@ -500,8 +514,8 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 		if len(text) <= streamQueueBytes {
 			for pendingBytes+len(text) > streamQueueBytes {
 				select {
-				case released := <-credits:
-					pendingBytes -= released
+				case <-credits.ready:
+					pendingBytes -= credits.take()
 				case <-writerExited:
 					return false
 				case <-ctx.Done():
@@ -514,8 +528,8 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 			select {
 			case queue <- streamUpdate{text: text}:
 				return true
-			case released := <-credits:
-				pendingBytes -= released
+			case <-credits.ready:
+				pendingBytes -= credits.take()
 			case <-writerExited:
 				return false
 			case <-ctx.Done():
@@ -586,10 +600,10 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 			status, e := saveFailure(err)
 			finalize(status, e, nil)
 			return
-		case released := <-credits:
-			// Keep the byte accounting current so the writer never has to wait for
-			// a credit slot.
-			pendingBytes -= released
+		case <-credits.ready:
+			// One notification can acknowledge any number of consumed fragments;
+			// never discard their byte count when the request loop is busy.
+			pendingBytes -= credits.take()
 		case update := <-updates:
 			if update.terminal {
 				var status string

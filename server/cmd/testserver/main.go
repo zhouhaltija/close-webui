@@ -91,6 +91,12 @@ func run() (runErr error) {
 	_ = std.Close()
 	var mu sync.Mutex
 	attempts := map[string]int{}
+	type performancePoint struct {
+		Marker      string  `json:"marker"`
+		SendEpochMs float64 `json:"sendEpochMs"`
+	}
+	performanceCases := map[string][]performancePoint{}
+	performanceOrder := []string{}
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer synthetic-key" {
 			http.Error(w, "synthetic test key required", 401)
@@ -127,7 +133,7 @@ func run() (runErr error) {
 			w.(http.Flusher).Flush()
 			return true
 		}
-		if !send("# 测试回答\n\n") {
+		if !strings.Contains(last, "[perf]") && !send("# 测试回答\n\n") {
 			return
 		}
 		if strings.Contains(last, "[failure]") && attempt == 1 {
@@ -150,21 +156,80 @@ func run() (runErr error) {
 		} else if strings.Contains(last, "[perf]") {
 			// Fixed cadence performance fixture: one chunk every 50ms, 20k characters
 			// including a code fence and a Markdown table, so the browser measurement
-			// exercises long answers and repeated highlighting.
+			// exercises long Markdown answers and final code highlighting.
+			// Separate fixture first-text waiting from transfer/render overhead.
+			w.(http.Flusher).Flush()
+			var firstTextDelay int
+			caseID := ""
+			for _, field := range strings.Fields(last) {
+				if strings.HasPrefix(field, "delay=") {
+					_, _ = fmt.Sscanf(field, "delay=%d", &firstTextDelay)
+				}
+				if parsed, parseErr := uuid.Parse(field); parseErr == nil {
+					caseID = parsed.String()
+				}
+			}
+			if caseID != "" {
+				mu.Lock()
+				if _, exists := performanceCases[caseID]; !exists {
+					if len(performanceOrder) >= 64 {
+						delete(performanceCases, performanceOrder[0])
+						performanceOrder = performanceOrder[1:]
+					}
+					performanceOrder = append(performanceOrder, caseID)
+				}
+				performanceCases[caseID] = nil
+				mu.Unlock()
+			}
+			if firstTextDelay != 0 && firstTextDelay != 500 && firstTextDelay != 2000 {
+				http.Error(w, "unsupported performance delay", 400)
+				return
+			}
+			if firstTextDelay > 0 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(time.Duration(firstTextDelay) * time.Millisecond):
+				}
+			}
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
-			filler := strings.Repeat("性能采样内容 ", 62)
+			filler := strings.Repeat("性能采样内容 ", 72)
 			chunks := []string{"# 性能采样\n\n"}
 			for i := 0; i < 40; i++ {
 				chunks = append(chunks, filler)
 			}
 			chunks = append(chunks, "\n\n| 列一 | 列二 |\n| --- | --- |\n| 甲 | 乙 |\n\n```go\npackage main\n\nfunc main() { println(\"CloseWebUI\") }\n```\n")
-			for _, chunk := range chunks {
+			for index, chunk := range chunks {
+				marker := fmt.Sprintf("【P%03d】", index)
+				if index == 0 {
+					chunk += marker
+				} else {
+					chunk = marker + chunk
+				}
+				measuredSend := func() bool {
+					// Epoch timestamps can be associated with the same local browser's
+					// timeOrigin clock. Store markers/times only, never request text.
+					at := float64(time.Now().UnixNano()) / 1e6
+					ok := send(chunk)
+					if ok && caseID != "" {
+						mu.Lock()
+						performanceCases[caseID] = append(performanceCases[caseID], performancePoint{marker, at})
+						mu.Unlock()
+					}
+					return ok
+				}
+				if index == 0 {
+					if !measuredSend() {
+						return
+					}
+					continue
+				}
 				select {
 				case <-r.Context().Done():
 					return
 				case <-ticker.C:
-					if !send(chunk) {
+					if !measuredSend() {
 						return
 					}
 				}
@@ -192,6 +257,23 @@ func run() (runErr error) {
 	mux.HandleFunc("/__test/upstream", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"url": up.URL + "/v1"})
+	})
+	mux.HandleFunc("/__test/performance", func(w http.ResponseWriter, r *http.Request) {
+		caseID, parseErr := uuid.Parse(r.URL.Query().Get("sample"))
+		if parseErr != nil {
+			http.Error(w, "invalid performance sample", 400)
+			return
+		}
+		mu.Lock()
+		points, found := performanceCases[caseID.String()]
+		copyPoints := append([]performancePoint(nil), points...)
+		mu.Unlock()
+		if !found {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"points": copyPoints, "clock": "same-host Unix epoch milliseconds; send start before local upstream Flush"})
 	})
 	var shutdownOnce sync.Once
 	mux.HandleFunc("/__test/shutdown", func(w http.ResponseWriter, r *http.Request) {

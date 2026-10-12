@@ -4,14 +4,220 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { useUI } from './core/ui-store';
+import type { Conversation, GenerationInput, MessageStatus } from './core/types';
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); useUI.setState({ drafts: {}, busy: false, error: '', realModelId: null, reasoning: {} }); });
 function mount(path = '/') {
   vi.stubEnv('VITE_ENABLE_MOCK', 'false');
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
   render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes><Route path="/" element={<App />} /><Route path="/chat/:conversationId" element={<App />} /><Route path="/settings/:section" element={<App />} /><Route path="/settings/providers/:providerId" element={<App />} /></Routes></MemoryRouter></QueryClientProvider>);
   return client;
 }
+
+function submissionFixture() {
+  const now = '2026-10-11T00:00:00Z';
+  const conversation: Conversation = { id: 'c1', title: '提交测试', createdAt: now, updatedAt: now, messages: [] };
+  const model = { id: 'm1', providerId: 'p1', modelId: 'ordinary-model', name: '测试模型', enabled: true, maxOutputTokens: 4096, defaultReasoning: {}, capabilities: { family: '', efforts: [], supportsToggle: false, mandatory: false, budgetMin: 0, budgetMax: 0, budgetSupported: false, outputMax: 4096, sources: [], known: false } };
+  const inputs: GenerationInput[] = [];
+  let removed = false;
+  let user = { id: 'u1', username: 'test_user' }; let signedOut = false;
+  let create = async () => structuredClone(conversation);
+  let generate = async (input: GenerationInput) => new Response(`${JSON.stringify({ type: 'done', assistantMessageId: input.assistantMessageId })}\n`);
+  let read = async () => structuredClone(conversation);
+  let stop: (id: string) => Promise<Response> = async () => new Response(null, { status: 204 });
+  vi.stubGlobal('fetch', async (url: string, init: RequestInit) => {
+    if (url.endsWith('/auth/me')) return signedOut ? Response.json({ error: { code: 'UNAUTHORIZED', message: '请登录。' } }, { status: 401 }) : Response.json(user);
+    if (url.endsWith('/auth/logout')) { signedOut = true; return new Response(null, { status: 204 }); }
+    if (url.endsWith('/auth/login')) { user = { id: 'u2', username: JSON.parse(init.body as string).username }; signedOut = false; return Response.json(user); }
+    if (url.endsWith('/models')) return Response.json([model]);
+    if (url.endsWith('/providers')) return Response.json([{ id: 'p1', name: '测试供应商', templateId: 'custom', protocol: 'openai-chat', adapter: 'standard', baseUrl: 'https://example.com/v1', enabled: true, hasKey: true }]);
+    if (url.endsWith('/provider-templates')) return Response.json([]);
+    if (url.endsWith('/preferences')) return Response.json({ defaultModelId: 'm1' });
+    if (url.endsWith('/generations')) { const input = JSON.parse(init.body as string) as GenerationInput; inputs.push(input); return generate(input); }
+    if (url.endsWith('/stop')) return stop(url.split('/').at(-2)!);
+    if (url.endsWith('/conversations/c1') && init.method === 'DELETE') { removed = true; return new Response(null, { status: 204 }); }
+    if (url.endsWith('/conversations/c1')) return removed ? Response.json({ error: { code: 'NOT_FOUND', message: '对话不存在。' } }, { status: 404 }) : Response.json(await read());
+    if (url.endsWith('/conversations') && init.method === 'POST') return Response.json(await create());
+    if (url.endsWith('/conversations')) return Response.json(removed || user.id !== 'u1' ? [] : [{ id: conversation.id, title: conversation.title, createdAt: now, updatedAt: now }]);
+    throw new Error(`Unexpected test request: ${url}`);
+  });
+  return {
+    conversation, inputs,
+    create: (handler: typeof create) => { create = handler; },
+    generate: (handler: typeof generate) => { generate = handler; },
+    read: (handler: typeof read) => { read = handler; },
+    stop: (handler: typeof stop) => { stop = handler; },
+    saved: (input: GenerationInput, status: MessageStatus, content: string): Conversation => ({ ...conversation, messages: [
+      { id: input.userMessageId, conversationId: conversation.id, role: 'user', content: input.content, status: 'completed', createdAt: now },
+      { id: input.assistantMessageId, conversationId: conversation.id, role: 'assistant', content, status, createdAt: now, modelId: input.modelId, generationId: input.generationId, reasoning: input.reasoning },
+    ] }),
+  };
+}
+
+it('removes a rejected submission from the visible history and cache before a second send while keeping a newer draft', async () => {
+  const fixture = submissionFixture(); let rejectSubmission!: (response: Response) => void;
+  fixture.generate(() => new Promise(resolve => { rejectSubmission = resolve; }));
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  const input = screen.getByRole('textbox', { name: '输入消息' });
+  fireEvent.change(input, { target: { value: '被拒绝的问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByText('正在提交…'); fireEvent.change(input, { target: { value: '后来输入的新草稿' } });
+  await act(async () => { rejectSubmission(Response.json({ error: { code: 'MODEL_DISABLED', message: '模型已停用。' } }, { status: 400 })); });
+  expect(await screen.findByRole('alert')).toHaveTextContent('模型已停用');
+  expect(screen.queryByText('正在提交…')).not.toBeInTheDocument();
+  expect(screen.queryByTestId('message-user')).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '重试回答' })).not.toBeInTheDocument();
+  expect(input).toHaveValue('后来输入的新草稿');
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages).toEqual([]);
+  fixture.generate(async input => new Response(`${JSON.stringify({ type: 'done', assistantMessageId: input.assistantMessageId })}\n`));
+  fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await waitFor(() => expect(fixture.inputs).toHaveLength(2)); await waitFor(() => expect(useUI.getState().busy).toBe(false));
+  expect(screen.getAllByTestId('message-user')).toHaveLength(1);
+  expect(screen.getByTestId('message-user')).toHaveTextContent('后来输入的新草稿');
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages).toHaveLength(2);
+});
+
+it('does not clear a newer draft when a delayed submission is accepted', async () => {
+  const fixture = submissionFixture(); let accept!: () => void;
+  fixture.generate(input => new Promise(resolve => { accept = () => resolve(new Response(`${JSON.stringify({ type: 'done', assistantMessageId: input.assistantMessageId })}\n`)); }));
+  mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  const input = screen.getByRole('textbox', { name: '输入消息' });
+  fireEvent.change(input, { target: { value: '已经发送的问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByText('正在提交…'); fireEvent.change(input, { target: { value: '下一条草稿' } });
+  await act(async () => { accept(); }); await waitFor(() => expect(useUI.getState().busy).toBe(false));
+  expect(input).toHaveValue('下一条草稿');
+});
+
+it('keeps the newer pending-route draft when a slow create resolves and the submission is accepted', async () => {
+  const fixture = submissionFixture(); let resolveCreate!: (conversation: Conversation) => void;
+  fixture.create(() => new Promise(resolve => { resolveCreate = resolve; }));
+  mount(); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '已发送的首页问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByText('正在提交…');
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '等待创建时的新草稿' } });
+  await act(async () => { resolveCreate(fixture.conversation); });
+  await waitFor(() => expect(fixture.inputs).toHaveLength(1)); await waitFor(() => expect(useUI.getState().busy).toBe(false));
+  expect(fixture.inputs[0].content).toBe('已发送的首页问题');
+  expect(screen.getByRole('textbox', { name: '输入消息' })).toHaveValue('等待创建时的新草稿');
+  expect(useUI.getState().drafts.c1).toBe('等待创建时的新草稿');
+});
+
+it('offers reconciliation instead of ordinary resend while an uncertain submission is offline', async () => {
+  const fixture = submissionFixture();
+  fixture.generate(async () => { fixture.read(async () => { throw new TypeError('offline'); }); throw new TypeError('offline'); });
+  fixture.stop(async () => { throw new TypeError('offline'); });
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  const input = screen.getByRole('textbox', { name: '输入消息' });
+  fireEvent.change(input, { target: { value: '结果未知的问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  const check = await screen.findByRole('button', { name: '核对提交状态' });
+  expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+  expect(screen.queryByRole('button', { name: '重试回答' })).not.toBeInTheDocument();
+  expect(input).toHaveValue('结果未知的问题');
+  expect(fixture.inputs).toHaveLength(1);
+  fixture.read(async () => fixture.saved(fixture.inputs[0], 'completed', '对账恢复的回答'));
+  fireEvent.click(check); await screen.findByText('对账恢复的回答');
+  expect(screen.queryByRole('button', { name: '核对提交状态' })).not.toBeInTheDocument();
+  expect(fixture.inputs).toHaveLength(1);
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages).toHaveLength(2);
+});
+
+it('retains the uncertain submission barrier across settings and reconciles the original generation on return', async () => {
+  const fixture = submissionFixture(); const stopped: string[] = [];
+  fixture.generate(async () => { fixture.read(async () => { throw new TypeError('offline'); }); throw new TypeError('offline'); });
+  fixture.stop(async id => { stopped.push(id); throw new TypeError('offline'); });
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '尚未核对的问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByRole('button', { name: '核对提交状态' });
+  fireEvent.keyDown(screen.getByRole('button', { name: '账户菜单：test_user' }), { key: 'Enter' }); fireEvent.click(await screen.findByRole('menuitem', { name: '设置' }));
+  fireEvent.click(await screen.findByRole('link', { name: '返回聊天' })); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '尚未核对的问题' } });
+  expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+  const original = fixture.inputs[0]; let cancelled = false;
+  fixture.read(async () => fixture.saved(original, cancelled ? 'stopped' : 'pending', '已保存的原回答'));
+  fixture.stop(async id => { stopped.push(id); cancelled = true; return new Response(null, { status: 204 }); });
+  fireEvent.click(screen.getByRole('button', { name: '核对提交状态' }));
+  await waitFor(() => expect(screen.queryByRole('button', { name: '核对提交状态' })).not.toBeInTheDocument());
+  expect(stopped.at(-1)).toBe(original.generationId);
+  expect(fixture.inputs).toHaveLength(1);
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages[1]).toMatchObject({ generationId: original.generationId, status: 'stopped', content: '已保存的原回答' });
+  fireEvent.click(screen.getByRole('button', { name: '提交测试' })); await screen.findByText('已保存的原回答');
+  fireEvent.click(screen.getByRole('button', { name: '新对话' }));
+  fixture.create(async () => ({ ...fixture.conversation, id: 'c2' }));
+  fixture.generate(async input => new Response(`${JSON.stringify({ type: 'done', assistantMessageId: input.assistantMessageId })}\n`));
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '核对后的新问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await waitFor(() => expect(client.getQueryData<Conversation>(['conversation', 'c2'])?.messages[1].status).toBe('completed'));
+  expect(await screen.findByTestId('message-user')).toHaveTextContent('核对后的新问题');
+});
+
+it('retains the original IDs when leaving chat during the first uncertain reconciliation read', async () => {
+  const fixture = submissionFixture(); let resolveRead!: (conversation: Conversation) => void;
+  fixture.generate(async () => { fixture.read(() => new Promise(resolve => { resolveRead = resolve; })); throw new TypeError('offline'); });
+  fixture.stop(async () => { throw new TypeError('offline'); });
+  mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '尚在核对的问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await waitFor(() => expect(resolveRead).toBeDefined());
+  fireEvent.keyDown(screen.getByRole('button', { name: '账户菜单：test_user' }), { key: 'Enter' }); fireEvent.click(await screen.findByRole('menuitem', { name: '设置' }));
+  fireEvent.click(await screen.findByRole('link', { name: '返回聊天' })); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '尚在核对的问题' } });
+  expect(screen.getByRole('button', { name: '发送消息' })).toBeDisabled();
+  expect(screen.getByRole('button', { name: '核对提交状态' })).toBeVisible();
+  await act(async () => { resolveRead(fixture.saved(fixture.inputs[0], 'completed', '被取消读取的迟到结果')); });
+  expect(screen.getByRole('button', { name: '核对提交状态' })).toBeVisible();
+  expect(fixture.inputs).toHaveLength(1);
+});
+
+it('clears the previous user’s uncertain submission when signing out from settings', async () => {
+  const fixture = submissionFixture();
+  fixture.generate(async () => { fixture.read(async () => { throw new TypeError('offline'); }); throw new TypeError('offline'); });
+  fixture.stop(async () => { throw new TypeError('offline'); });
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '原账号未决问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByRole('button', { name: '核对提交状态' });
+  fireEvent.keyDown(screen.getByRole('button', { name: '账户菜单：test_user' }), { key: 'Enter' }); fireEvent.click(await screen.findByRole('menuitem', { name: '设置' }));
+  await screen.findByRole('link', { name: '返回聊天' });
+  fireEvent.keyDown(screen.getByRole('button', { name: '账户菜单：test_user' }), { key: 'Enter' }); fireEvent.click(await screen.findByRole('menuitem', { name: '退出登录' }));
+  await screen.findByRole('heading', { name: '登录 CloseWebUI' });
+  fireEvent.change(screen.getByLabelText('用户名'), { target: { value: 'test_other' } }); fireEvent.change(screen.getByLabelText('密码'), { target: { value: 'synthetic-password' } }); fireEvent.click(screen.getByRole('button', { name: '登录' }));
+  await screen.findByRole('button', { name: '账户菜单：test_other' }); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  expect(client.getQueryData(['conversation', 'c1'])).toBeUndefined();
+  expect(screen.queryByRole('button', { name: '核对提交状态' })).not.toBeInTheDocument();
+  expect(screen.getByRole('textbox', { name: '输入消息' })).toHaveValue('');
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '新账号草稿' } });
+  expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+});
+
+it('ignores a delayed manual reconciliation after the session has expired', async () => {
+  const fixture = submissionFixture(); let resolveRead!: (conversation: Conversation) => void;
+  fixture.generate(async () => { fixture.read(async () => { throw new TypeError('offline'); }); throw new TypeError('offline'); });
+  fixture.stop(async () => { throw new TypeError('offline'); });
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '原账号问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  const check = await screen.findByRole('button', { name: '核对提交状态' });
+  fixture.read(() => new Promise(resolve => { resolveRead = resolve; })); fireEvent.click(check);
+  act(() => { window.dispatchEvent(new Event('closewebui:unauthorized')); }); await screen.findByRole('heading', { name: '登录 CloseWebUI' });
+  await act(async () => { resolveRead(fixture.saved(fixture.inputs[0], 'completed', '原账号迟到回答')); });
+  expect(client.getQueryData(['conversation', 'c1'])).toBeUndefined();
+  expect(useUI.getState()).toMatchObject({ drafts: {}, preview: null, busy: false, error: '' });
+  expect(screen.queryByText('原账号迟到回答')).not.toBeInTheDocument();
+});
+
+it('deletes an uncertain conversation without letting its late reconciliation restore history or block a new chat', async () => {
+  const fixture = submissionFixture(); let resolveRead!: (conversation: Conversation) => void;
+  fixture.generate(async () => { fixture.read(async () => { throw new TypeError('offline'); }); throw new TypeError('offline'); });
+  fixture.stop(async () => { throw new TypeError('offline'); });
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '未决问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  const check = await screen.findByRole('button', { name: '核对提交状态' });
+  fixture.read(() => new Promise(resolve => { resolveRead = resolve; })); fireEvent.click(check);
+  fireEvent.keyDown(screen.getByRole('button', { name: '对话菜单：提交测试' }), { key: 'Enter' });
+  fireEvent.click(await screen.findByRole('menuitem', { name: '删除' })); fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+  await waitFor(() => expect(screen.queryByRole('button', { name: '对话菜单：提交测试' })).not.toBeInTheDocument());
+  await act(async () => { resolveRead(fixture.saved(fixture.inputs[0], 'completed', '删除后的迟到回答')); });
+  expect(client.getQueryData(['conversation', 'c1'])).toBeUndefined();
+  expect(screen.queryByText('删除后的迟到回答')).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '核对提交状态' })).not.toBeInTheDocument();
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '新对话草稿' } });
+  expect(screen.getByRole('button', { name: '发送消息' })).toBeEnabled();
+});
 it('requires login before querying private history and clears drafts on expiration', async () => {
   let signedIn = false; const paths: string[] = [];
   vi.stubGlobal('fetch', async (url: string) => { paths.push(url); if (url.endsWith('/auth/me')) return Response.json({ error: { code: 'UNAUTHORIZED', message: '请登录。' } }, { status: 401 }); if (url.endsWith('/auth/login')) { signedIn = true; return Response.json({ id: 'u1', username: 'demo_user' }); } if (url.endsWith('/preferences')) return Response.json({ defaultModelId: null }); return Response.json([]); });

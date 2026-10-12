@@ -153,6 +153,27 @@ func TestMigrationOwnershipCancellationAndRollback(t *testing.T) {
 	if err = Down(ctx, sqlDB); err != nil {
 		t.Fatal(err)
 	}
+	// Down only reverses the latest metadata migration. Account/history tables
+	// and their data must survive that deployment rollback.
+	if _, err = queries.GetUser(ctx, first); err != nil {
+		t.Fatalf("metadata rollback lost existing account: %v", err)
+	}
+	var metadataColumns int
+	if err = conn.QueryRow(ctx, "SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='models' AND column_name='discovery_metadata'").Scan(&metadataColumns); err != nil || metadataColumns != 0 {
+		t.Fatal("metadata rollback left discovery column")
+	}
+	if err = Up(ctx, sqlDB); err != nil {
+		t.Fatalf("metadata migration could not be reapplied: %v", err)
+	}
+	if _, err = queries.GetUser(ctx, first); err != nil {
+		t.Fatalf("metadata reapply lost existing account: %v", err)
+	}
+	if err = Down(ctx, sqlDB); err != nil {
+		t.Fatal(err)
+	}
+	if err = Down(ctx, sqlDB); err != nil {
+		t.Fatal(err)
+	}
 	var table *string
 	if err = conn.QueryRow(ctx, "SELECT to_regclass('users')::text").Scan(&table); err != nil || table != nil {
 		t.Fatal("rollback left users table")

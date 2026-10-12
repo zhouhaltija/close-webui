@@ -8,7 +8,7 @@ const cachedGo = resolve(root, '.cache/toolchain/go/bin', process.platform === '
 const go = existsSync(cachedGo) ? cachedGo : 'go';
 const operation = process.argv[2] || 'dev';
 const binaryName = process.platform === 'win32' ? 'closewebui-server.exe' : 'closewebui-server';
-const commands = { dev: ['run', './cmd/server'], migrate: ['run', './cmd/server', '-migrate', 'up'], rollback: ['run', './cmd/server', '-migrate', 'down'], test: ['test', './...'], vet: ['vet', './...'], build: ['build', '-o', `../.cache/bin/${binaryName}`, './cmd/server'] };
+const commands = { dev: ['run', './cmd/server'], migrate: ['run', './cmd/server', '-migrate', 'up'], rollback: ['run', './cmd/server', '-migrate', 'down'], test: ['test', '-timeout=25m', './...'], vet: ['vet', './...'], build: ['build', '-o', `../.cache/bin/${binaryName}`, './cmd/server'] };
 if (!(operation in commands)) throw new Error(`Unknown backend operation: ${operation}`);
 if (operation === 'build') await new Promise((accept, reject) => {
   const frontend = spawn(process.execPath, ['scripts/frontend.mjs', 'build'], { cwd: root, stdio: 'inherit', windowsHide: true });

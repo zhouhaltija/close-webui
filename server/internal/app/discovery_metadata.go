@@ -71,7 +71,7 @@ func (a *App) cachedDiscovery(p db.Provider) (discoveryCache, bool) {
 	return value, ok
 }
 
-func (a *App) cacheDiscovery(p db.Provider, models []upstream.DiscoveredModel) {
+func (a *App) cacheDiscovery(p db.Provider, models []upstream.DiscoveredModel, preferredIDs ...string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.discovered == nil {
@@ -89,8 +89,24 @@ func (a *App) cacheDiscovery(p db.Provider, models []upstream.DiscoveredModel) {
 		delete(a.discovered, oldest)
 	}
 	value := discoveryCache{at: time.Now(), models: make(map[string]upstream.DiscoveredModel)}
-	for i, m := range models {
-		if i >= discoveryCacheModels {
+	// A requested tail candidate must remain verifiable when the upstream list
+	// is larger than our bounded cache. Prioritize it without growing the cache.
+	for _, id := range preferredIDs {
+		if len(value.models) >= discoveryCacheModels {
+			break
+		}
+		// A nil-metadata entry also records an explicit absence from the full
+		// upstream result, rather than an absence caused by cache truncation.
+		value.models[id] = upstream.DiscoveredModel{ID: id}
+		for _, m := range models {
+			if m.ID == id {
+				value.models[id] = m
+				break
+			}
+		}
+	}
+	for _, m := range models {
+		if len(value.models) >= discoveryCacheModels {
 			break
 		}
 		value.models[m.ID] = m
@@ -100,7 +116,7 @@ func (a *App) cacheDiscovery(p db.Provider, models []upstream.DiscoveredModel) {
 
 // A row lock serializes connection edits with publication. Late discoveries
 // never replace metadata belonging to the newer connection or key.
-func (a *App) rememberDiscovery(ctx context.Context, p db.Provider, models []upstream.DiscoveredModel) error {
+func (a *App) rememberDiscovery(ctx context.Context, p db.Provider, models []upstream.DiscoveredModel, preferredIDs ...string) error {
 	tx, err := a.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -132,14 +148,19 @@ func (a *App) rememberDiscovery(ctx context.Context, p db.Provider, models []ups
 	if err = q.UpdateDiscoveredModelsMetadata(ctx, db.UpdateDiscoveredModelsMetadataParams{UserID: p.UserID, ProviderID: p.ID, DiscoveryRecords: raw}); err != nil {
 		return err
 	}
+	// Hold publication across COMMIT: the row lock can be granted to the next
+	// transaction before Commit returns to this goroutine. That transaction must
+	// not publish its cache (or validate a model) ahead of this committed result.
+	a.discoveryPublishMu.Lock()
+	defer a.discoveryPublishMu.Unlock()
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
-	a.cacheDiscovery(p, models)
+	a.cacheDiscovery(p, models, preferredIDs...)
 	return nil
 }
 
-func (a *App) discoverAndRemember(ctx context.Context, p db.Provider) ([]upstream.DiscoveredModel, error) {
+func (a *App) discoverAndRemember(ctx context.Context, p db.Provider, preferredIDs ...string) ([]upstream.DiscoveredModel, error) {
 	cfg, err := a.providerConfig(p)
 	if err != nil {
 		return nil, err
@@ -150,7 +171,7 @@ func (a *App) discoverAndRemember(ctx context.Context, p db.Provider) ([]upstrea
 	if err != nil {
 		return nil, err
 	}
-	if err = a.rememberDiscovery(ctx, p, models); err != nil {
+	if err = a.rememberDiscovery(ctx, p, models, preferredIDs...); err != nil {
 		return nil, err
 	}
 	return models, nil
@@ -160,6 +181,7 @@ func (a *App) metadataForModel(ctx context.Context, p db.Provider, m db.Model) *
 	if metadata := effectiveMetadata(p, m); metadata != nil {
 		return metadata
 	}
+	needsTargetedDiscovery := false
 	if cache, ok := a.cachedDiscovery(p); ok {
 		if entry, found := cache.models[m.ModelID]; found {
 			return entry.Metadata
@@ -167,13 +189,14 @@ func (a *App) metadataForModel(ctx context.Context, p db.Provider, m db.Model) *
 		if len(cache.models) < discoveryCacheModels {
 			return nil
 		}
+		needsTargetedDiscovery = true
 	}
 	// Known static entries remain fully usable offline. An unregistered manual
 	// ID can still gain the documented facts via a non-generating GET /models.
-	if upstream.Capabilities(p.Adapter, p.Protocol, m.ModelID).Known {
+	if !needsTargetedDiscovery && upstream.Capabilities(p.Adapter, p.Protocol, m.ModelID).Known {
 		return nil
 	}
-	models, err := a.discoverAndRemember(ctx, p)
+	models, err := a.discoverAndRemember(ctx, p, m.ModelID)
 	if err != nil {
 		return nil
 	}
@@ -205,14 +228,38 @@ func (a *App) saveValidatedModel(ctx context.Context, p db.Provider, m db.Model,
 	if connectionFingerprint(fresh) != connectionFingerprint(p) {
 		return db.Model{}, reject(409, "CONFIGURATION_CHANGED", errDiscoveryChanged.Error())
 	}
+	var existing db.Model
+	newBinding := create
 	if !create {
-		existing, readErr := q.GetModel(ctx, db.GetModelParams{ID: m.ID, UserID: m.UserID})
-		if readErr != nil {
-			return db.Model{}, readErr
+		existing, err = q.GetModel(ctx, db.GetModelParams{ID: m.ID, UserID: m.UserID})
+		if err != nil {
+			return db.Model{}, err
 		}
-		if existing.ProviderID == m.ProviderID && existing.ModelID == m.ModelID && effectiveMetadata(p, existing) != nil {
-			m.DiscoveryMetadata = existing.DiscoveryMetadata
+		newBinding = existing.ProviderID != m.ProviderID || existing.ModelID != m.ModelID
+	}
+	a.discoveryPublishMu.Lock()
+	// A preceding discovery may have committed but still be publishing its cache.
+	// The provider row lock now keeps later discoveries behind this validation.
+	metadata := effectiveMetadata(p, m)
+	cache, cached := a.cachedDiscovery(p)
+	if cached {
+		if entry, found := cache.models[m.ModelID]; found {
+			metadata = entry.Metadata
+		} else if newBinding {
+			if len(cache.models) >= discoveryCacheModels {
+				a.discoveryPublishMu.Unlock()
+				return db.Model{}, reject(409, "DISCOVERY_CHANGED", "模型发现结果已更新，请重新拉取模型后保存。")
+			}
+			metadata = nil
 		}
+	}
+	a.discoveryPublishMu.Unlock()
+	if newBinding && !cached && metadata != nil {
+		return db.Model{}, reject(409, "DISCOVERY_CHANGED", "模型发现结果已失效，请重新拉取模型后保存。")
+	}
+	m.DiscoveryMetadata = discoveryBytes(p, m.ModelID, metadata)
+	if !newBinding {
+		m.DiscoveryMetadata = existing.DiscoveryMetadata
 	}
 	var reasoning upstream.Reasoning
 	_ = json.Unmarshal(m.DefaultReasoning, &reasoning)
