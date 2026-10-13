@@ -35,6 +35,35 @@ async function identityAndModels(route: Route) {
   return false;
 }
 
+test('a refreshed page observes the saved terminal state without stopping a server-owned answer', async ({ page }) => {
+  const date = '2026-10-13T00:00:00Z';
+  const stops: string[] = []; let terminal = false;
+  const conversation = { id: 'service-chat', title: '刷新恢复对话', createdAt: date, updatedAt: date };
+  await page.route('**/integration-api/**', async route => {
+    if (await identityAndModels(route)) return;
+    const path = new URL(route.request().url()).pathname;
+    if (path.endsWith('/stop')) { stops.push(path); await route.fulfill({ status: 204 }); return; }
+    if (path.endsWith('/conversations')) { await route.fulfill({ json: [conversation] }); return; }
+    if (path.endsWith('/conversations/service-chat')) {
+      await route.fulfill({ json: { ...conversation, messages: [
+        { id: 'saved-user', conversationId: 'service-chat', role: 'user', content: '刷新前的问题', status: 'completed', createdAt: date },
+        { id: 'saved-assistant', conversationId: 'service-chat', role: 'assistant', content: '数据库确认的前缀', status: terminal ? 'stopped' : 'streaming', generationId: 'old-generation', modelId: 'service-model', createdAt: date },
+      ] } }); return;
+    }
+    throw new Error(`Unexpected recovery request: ${path}`);
+  });
+  await page.goto('/chat/service-chat');
+  await expect(page.getByTestId('message-assistant')).toHaveAttribute('data-status', 'streaming');
+  await page.reload();
+  await expect(page.getByTestId('message-assistant')).toHaveAttribute('data-status', 'streaming');
+  terminal = true;
+  await expect(page.getByTestId('message-assistant')).toHaveAttribute('data-status', 'stopped');
+  await expect(page.getByRole('button', { name: '复制回答' })).toBeVisible();
+  await expect(page.getByTestId('message-assistant')).toContainText('数据库确认的前缀');
+  await expect(page.getByLabel('正在生成')).toHaveCount(0);
+  expect(stops).toEqual([]);
+});
+
 test('disabled Mock uses the configured API and preserves input on service failure', async ({ page }) => {
   await page.addInitScript(() => localStorage.setItem('closewebui:data:v1', '{untouched'));
   const paths: string[] = [];

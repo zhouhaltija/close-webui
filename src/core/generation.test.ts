@@ -21,6 +21,81 @@ function harness() {
 const flush = () => new Promise(resolve => setTimeout(resolve, 40));
 const previewMessages = (h: ReturnType<typeof harness>) => h.previews.filter(Boolean).at(-1)!.messages;
 
+it('releases settled read snapshots while other in-flight reads still protect the terminal answer', async () => {
+  const h = harness(); const g = new GenerationCoordinator(h.deps); const pending = g.send('读取问题', 'chat'); await flush();
+  const assistant = h.published.at(-1)!.messages[1];
+  const first = g.captureSnapshot('chat'); const remaining = g.captureSnapshot('chat');
+  const saved: Conversation = { ...h.published.at(-1)!, messages: h.published.at(-1)!.messages.map(message => message.role === 'assistant' ? { ...message, content: '保存前缀', status: 'streaming' } : message) };
+  h.event({ type: 'delta', assistantMessageId: assistant.id, content: '页面上的完整正文' });
+  h.event({ type: 'done', assistantMessageId: assistant.id }); await pending;
+  expect(first(saved).messages[1]).toMatchObject({ content: '页面上的完整正文', status: 'completed' });
+  g.releaseSnapshot(first);
+  expect(first(saved).messages[1]).toMatchObject({ content: '保存前缀', status: 'streaming' });
+  expect(remaining(saved).messages[1]).toMatchObject({ content: '页面上的完整正文', status: 'completed' });
+  g.releaseSnapshot(remaining);
+  expect(remaining(saved).messages[1]).toMatchObject({ content: '保存前缀', status: 'streaming' });
+  const fresh = g.captureSnapshot('chat');
+  expect(fresh(saved).messages[1]).toMatchObject({ content: '保存前缀', status: 'streaming' });
+  g.releaseSnapshot(fresh);
+});
+
+it('stops the original generation before recovering a saved prefix that has no durable terminal state', async () => {
+  const h = harness(); const g = new GenerationCoordinator(h.deps); const pending = g.send('保存问题', 'chat', undefined, { modelId: 'm1' }); await flush();
+  const assistant = h.published.at(-1)!.messages[1];
+  h.event({ type: 'delta', assistantMessageId: assistant.id, content: '已保存前缀与实时尾段' });
+  h.event({ type: 'error', assistantMessageId: assistant.id, code: 'SAVE_FAILED', message: '保存失败。' }); await pending;
+  let saved = { ...h.published.at(-1)!, messages: h.published.at(-1)!.messages.map(message => message.role === 'assistant' ? { ...message, content: '已保存前缀', status: 'streaming' as const, error: undefined } : message) };
+  h.api.get = async () => saved;
+  h.api.stop = async () => { throw new Error('无法停止原生成。'); };
+  expect(await g.recoverSaved('chat')).toBe(false);
+  expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'failed', content: '已保存前缀与实时尾段' });
+  expect(g.hasSaveFailure('chat')).toBe(true);
+  h.api.stop = async (id, generationId) => {
+    if (id !== 'chat' || generationId !== assistant.generationId) throw new Error('Incorrect original generation');
+    saved = { ...saved, messages: saved.messages.map(message => message.role === 'assistant' ? { ...message, status: 'stopped' as const } : message) };
+  };
+  expect(await g.recoverSaved('chat')).toBe(true);
+  expect(h.published.at(-1)!.messages[1]).toMatchObject({ status: 'stopped', content: '已保存前缀' });
+  expect(g.hasSaveFailure('chat')).toBe(false);
+});
+
+it('does not let a cancelled recovery response replace a newer recovery of the same generation', async () => {
+  const h = harness(); const g = new GenerationCoordinator(h.deps); const pending = g.send('保存问题', 'chat', undefined, { modelId: 'm1' }); await flush();
+  const assistant = h.published.at(-1)!.messages[1];
+  h.event({ type: 'delta', assistantMessageId: assistant.id, content: '实时尾段' });
+  h.event({ type: 'error', assistantMessageId: assistant.id, code: 'SAVE_FAILED', message: '保存失败。' }); await pending;
+  h.api.stop = async () => {};
+  const reads: ((snapshot: Conversation) => void)[] = [];
+  h.api.get = () => new Promise(resolve => { reads.push(resolve); });
+  const old = g.recoverSaved('chat'); await flush(); g.stop();
+  const latest = g.recoverSaved('chat'); await flush();
+  const count = h.published.length;
+  const saved: Conversation = { ...h.published.at(-1)!, messages: h.published.at(-1)!.messages.map(message => message.role === 'assistant' ? { ...message, content: '保存前缀', status: 'stopped' } : message) };
+  reads[0](saved); expect(await old).toBe(false);
+  expect(h.published).toHaveLength(count); expect(g.isActive).toBe(true); expect(h.busy.at(-1)).toBe(true);
+  reads[1](saved); expect(await latest).toBe(true);
+  expect(h.published.at(-1)!.messages[1].content).toBe('保存前缀');
+});
+
+it('retains each failed conversation’s live tail when another conversation also fails to save', async () => {
+  const h = harness(); const g = new GenerationCoordinator(h.deps);
+  h.api.get = async id => ({ id, title: '测试', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] });
+  for (const id of ['first', 'second']) {
+    const pending = g.send('保存问题', id, undefined, { modelId: 'm1' }); await flush();
+    const assistant = h.published.at(-1)!.messages[1];
+    h.event({ type: 'delta', assistantMessageId: assistant.id, content: `${id}实时尾段` });
+    h.event({ type: 'error', assistantMessageId: assistant.id, code: 'SAVE_FAILED', message: '保存失败。' }); await pending;
+  }
+  const first = await h.api.get('first');
+  expect(g.preserveLive(first).messages[1]?.content).toBe('first实时尾段');
+  expect(g.hasSaveFailure('first')).toBe(true);
+  const second = await h.api.get('second');
+  expect(g.preserveLive(second).messages[1].content).toBe('second实时尾段');
+  g.conversationRemoved('first');
+  expect(g.preserveLive(first).messages).toEqual([]);
+  expect(g.hasSaveFailure('second')).toBe(true);
+});
+
 it('rolls back a rejected unsaved pair before loading the cache for another send', async () => {
   const h = harness(); let cached: Conversation = { id: 'chat', title: '已保存', createdAt: '2026-10-10T00:00:00Z', updatedAt: '2026-10-10T00:00:00Z', messages: [] };
   h.deps.load = () => cached; h.deps.publish = c => { cached = c; h.published.push(c); };

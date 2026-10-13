@@ -109,6 +109,34 @@ func (a *App) getConversation(w http.ResponseWriter, r *http.Request) {
 		dbError(w, err)
 		return
 	}
+	// A failed terminal save can outlive its request. In this single-instance
+	// service, jobs register before their initial transaction and stay registered
+	// through draining and finalization. Only a missing job proves an orphan.
+	recovered := false
+	for _, m := range messages {
+		if m.Role != "assistant" || m.GenerationID == nil || (m.Status != "pending" && m.Status != "streaming") {
+			continue
+		}
+		a.mu.Lock()
+		job := a.active[*m.GenerationID]
+		live := job != nil && job.userID == c.UserID && job.conversationID == c.ID
+		a.mu.Unlock()
+		if live {
+			continue
+		}
+		if _, err := a.finish(c.UserID, c.ID, *m.GenerationID, "stopped", nil, m.Metadata); err != nil {
+			dbError(w, err)
+			return
+		}
+		recovered = true
+	}
+	if recovered {
+		messages, err = a.queries.ListMessages(r.Context(), db.ListMessagesParams{ConversationID: c.ID, UserID: c.UserID})
+		if err != nil {
+			dbError(w, err)
+			return
+		}
+	}
 	list := make([]messageView, 0, len(messages))
 	for _, m := range messages {
 		list = append(list, messageDTO(m))

@@ -126,7 +126,7 @@ for (const width of [1440, 1024, 390]) {
       if (section === 'models') {
         const model = main.getByRole('article').filter({ has: page.getByRole('heading', { name: '测试推理模型', exact: true }) });
         await expect(model).toBeVisible();
-        await expect(model.locator('.provider-url')).toHaveText('gpt-5.1');
+        await expect(model.getByText('gpt-5.1', { exact: true })).toBeVisible();
         await expect(model.getByText('默认模型', { exact: true })).toBeVisible();
       }
       if (section === 'account') await expect(main.getByLabel('确认新密码', { exact: true })).toBeVisible();

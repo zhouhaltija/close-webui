@@ -307,12 +307,32 @@ func (c *perfStreamCollector) waitFor(t *testing.T, description string, predicat
 	t.Helper()
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
-		if events := c.snapshot(); predicate(events) {
+		events := c.snapshot()
+		if predicate(events) {
 			return events
+		}
+		// A terminal event or closed transport makes the expected progress
+		// impossible. Report it now instead of waiting out the success timeout.
+		if perfHasEventOfType(events, "error") || perfHasEventOfType(events, "done") {
+			break
+		}
+		select {
+		case <-c.done:
+			goto ended
+		default:
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("等待 %s 超时：%+v", description, c.snapshot())
+ended:
+	events := c.snapshot()
+	if predicate(events) {
+		return events
+	}
+	var last perfStreamEvent
+	if len(events) > 0 {
+		last = events[len(events)-1]
+	}
+	t.Fatalf("等待 %s 未达到预期：events=%d visibleBytes=%d lastType=%q lastCode=%q lastMessage=%q lastAt=%s", description, len(events), len(perfVisibleText(events)), last.Type, last.Code, last.Message, last.At.Format(time.RFC3339Nano))
 	return nil
 }
 
@@ -391,6 +411,11 @@ type perfQueryTracer struct {
 	// failFrom makes every appendDelta statement from the Nth one onwards fail,
 	// which injects a deterministic mid-stream persistence failure.
 	failFrom atomic.Int64
+	// Gates block real SQL at the pgx boundary, without replacing persistence.
+	gate          <-chan struct{}
+	entered       chan struct{}
+	gateTerminal  bool
+	failCompleted atomic.Bool
 }
 
 type perfTraceContextKey struct{}
@@ -407,16 +432,34 @@ func (p *perfQueryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, d
 		fail = p.failFrom.Load() > 0 && int64(p.deltaRuns) >= p.failFrom.Load()
 	}
 	p.mu.Unlock()
-	if !record.Delta {
+	terminal := strings.HasPrefix(data.SQL, "UPDATE generations SET status=") && len(data.Args) > 0 && (data.Args[0] == "completed" || data.Args[0] == "failed")
+	if (record.Delta && !p.gateTerminal) || (terminal && p.gateTerminal) {
+		if p.entered != nil {
+			select {
+			case p.entered <- struct{}{}:
+			default:
+			}
+		}
+		if p.gate != nil {
+			select {
+			case <-p.gate:
+			case <-ctx.Done():
+			}
+		}
+	}
+	fail = fail || (terminal && data.Args[0] == "completed" && p.failCompleted.Load())
+	if !record.Delta && !fail {
 		return context.WithValue(ctx, perfTraceContextKey{}, record)
 	}
 	if delay := time.Duration(p.delay.Load()); delay > 0 {
 		time.Sleep(delay)
 	}
 	if fail {
+		p.mu.Lock()
 		record.End = time.Now()
 		record.Ended = true
 		record.Err = context.Canceled
+		p.mu.Unlock()
 		cancelled, cancel := context.WithCancel(ctx)
 		cancel()
 		return cancelled
@@ -426,7 +469,12 @@ func (p *perfQueryTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, d
 
 func (p *perfQueryTracer) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
 	record, ok := ctx.Value(perfTraceContextKey{}).(*perfTraceRecord)
-	if !ok || record.Ended {
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if record.Ended {
 		return
 	}
 	record.End = time.Now()
@@ -437,7 +485,12 @@ func (p *perfQueryTracer) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, dat
 func (p *perfQueryTracer) snapshot() []*perfTraceRecord {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]*perfTraceRecord(nil), p.records...)
+	result := make([]*perfTraceRecord, len(p.records))
+	for i, record := range p.records {
+		copy := *record
+		result[i] = &copy
+	}
+	return result
 }
 
 func (p *perfQueryTracer) deltaRecords() []*perfTraceRecord {
@@ -836,12 +889,25 @@ func TestAppendDeltaRejectsLateBatchesAfterStopDeleteAndRetry(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("upstream did not start")
 	}
-	events := collector.waitFor(t, "first durable delta", func(events []perfStreamEvent) bool { return perfHasEventOfType(events, "delta") })
+	events := collector.waitFor(t, "first live delta", func(events []perfStreamEvent) bool { return perfHasEventOfType(events, "delta") })
 	if events[0].Content != "第一段" {
 		t.Fatalf("unexpected first delta: %+v", events[0])
 	}
 	gid := input["generationId"].(string)
 	mid := input["assistantMessageId"].(string)
+	// A live delta no longer confirms saving. Wait for the real writer before
+	// injecting this test-only second writer, whose ordering is not a public API.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		messages := f.readConversation(t)
+		if len(messages) == 2 && messages[1].Content == "第一段" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first live fragment was not eventually persisted")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err := f.app.appendDelta(f.user, f.conversation, gid, mid, "并发片段"); err != nil {
 		t.Fatalf("concurrent batch rejected before stop: %v", err)
 	}
@@ -966,7 +1032,8 @@ func TestGenerationStreamFourProtocolsPersistEverythingVisible(t *testing.T) {
 			if events[len(events)-1].Type != "done" {
 				t.Fatalf("done was not the final event: %+v", events)
 			}
-			// Save-then-send: every emitted batch was persisted before it was sent.
+			// Live send/save batches can differ. Completion must follow every
+			// ordered successful write and confirm the entire visible answer.
 			writes := tracer.deltaRecords()
 			if len(writes) == 0 {
 				t.Fatal("no atomic appendDelta statement was issued")
@@ -974,26 +1041,17 @@ func TestGenerationStreamFourProtocolsPersistEverythingVisible(t *testing.T) {
 			if len(writes) > len(fragments) {
 				t.Fatalf("%d writes for %d fragments: merging was lost", len(writes), len(fragments))
 			}
-			for _, event := range events {
-				if event.Type != "delta" {
-					continue
+			done, _ := perfLastEventOfType(events, "done")
+			var saved strings.Builder
+			for _, write := range writes {
+				if len(write.Args) < 4 || write.Err != nil || write.End.IsZero() || done.At.Before(write.End) {
+					t.Fatal("completion preceded successful persistence")
 				}
-				matched := false
-				for _, write := range writes {
-					if len(write.Args) < 4 || write.Err != nil || write.End.IsZero() {
-						continue
-					}
-					if text, _ := write.Args[3].(string); text != event.Content {
-						continue
-					}
-					if !event.At.Before(write.End.Add(-2 * time.Millisecond)) {
-						matched = true
-						break
-					}
-				}
-				if !matched {
-					t.Fatalf("delta %q was emitted before it was persisted", event.Content)
-				}
+				text, _ := write.Args[3].(string)
+				saved.WriteString(text)
+			}
+			if saved.String() != want {
+				t.Fatal("ordered writes lost or duplicated text")
 			}
 			if peak := peakConcurrentWrites(writes); peak != 1 {
 				t.Fatalf("peak concurrent appendDelta statements = %d, want 1", peak)
@@ -1126,7 +1184,7 @@ func TestGenerationStreamWriteFailureNeverReportsSuccess(t *testing.T) {
 	tracer.failFrom.Store(2)
 	tracer.swapPool(t, f.app, f.schema)
 	response, _, collector := f.startGeneration(t, "写失败")
-	collector.waitFor(t, "first durable delta", func(events []perfStreamEvent) bool { return perfHasEventOfType(events, "delta") })
+	collector.waitFor(t, "first live delta", func(events []perfStreamEvent) bool { return perfHasEventOfType(events, "delta") })
 	collector.waitFor(t, "error", func(events []perfStreamEvent) bool { return perfHasEventOfType(events, "error") })
 	perfDrainBody(t, response)
 	events := collector.snapshot()
@@ -1137,8 +1195,12 @@ func TestGenerationStreamWriteFailureNeverReportsSuccess(t *testing.T) {
 	if len(messages) != 2 || messages[1].Status != "failed" {
 		t.Fatalf("write failure did not persist a failed state: %+v", messages)
 	}
-	if messages[1].Content != perfVisibleText(events) {
-		t.Fatalf("client saw %q but only %q was persisted", perfVisibleText(events), messages[1].Content)
+	if !strings.HasPrefix(perfVisibleText(events), messages[1].Content) {
+		t.Fatalf("saved text %q is not a prefix of live text %q", messages[1].Content, perfVisibleText(events))
+	}
+	problem, ok := perfLastEventOfType(events, "error")
+	if !ok || problem.Code != "SAVE_FAILED" {
+		t.Fatalf("missing saving failure: %+v", events)
 	}
 	if !strings.HasPrefix(strings.Join(fragments, ""), messages[1].Content) {
 		t.Fatalf("persisted text %q is not a prefix of the answer", messages[1].Content)

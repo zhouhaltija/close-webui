@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"closewebui/server/internal/db"
 	"closewebui/server/internal/security"
@@ -244,6 +245,7 @@ func (a *App) begin(ctx context.Context, uid, cid string, in *generationInput) (
 }
 
 var errInactive = errors.New("generation is no longer active")
+var errSaveFailed = errors.New("回答保存失败，当前显示的末尾内容可能尚未保存；刷新后仅恢复已保存部分。")
 
 func durableContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 10*time.Second)
@@ -257,6 +259,10 @@ func durableContext() (context.Context, context.CancelFunc) {
 func (a *App) appendDelta(uid, cid, gid, assistantID, delta string) error {
 	ctx, cancel := durableContext()
 	defer cancel()
+	return a.appendDeltaContext(ctx, uid, cid, gid, assistantID, delta)
+}
+
+func (a *App) appendDeltaContext(ctx context.Context, uid, cid, gid, assistantID, delta string) error {
 	var updated string
 	var messages int
 	err := a.pool.QueryRow(ctx, `WITH generation AS (
@@ -387,8 +393,8 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 	if err = rc.Flush(); err != nil {
 		return
 	}
-	// Delta emission happens on the writer goroutine while heartbeats are written
-	// by this loop, so all response writes are serialized.
+	// The request loop sends live deltas while the persistence worker saves them.
+	// Response writes remain serialized, including heartbeats and terminal errors.
 	var writeMu sync.Mutex
 	emit := func(event any) error {
 		writeMu.Lock()
@@ -400,24 +406,30 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush()
 	}
 	updates := make(chan streamUpdate, 16)
+	upstreamCtx, stopUpstream := context.WithCancel(ctx)
+	defer stopUpstream()
 	go func() {
-		meta, e := a.upstream.Stream(ctx, provider, upstream.ModelConfig{ModelID: snap.NativeModelID, MaxOutputTokens: snap.MaxOutputTokens, Reasoning: snap.Reasoning, Metadata: snap.DiscoveryMetadata}, history, func(text string) error {
+		meta, e := a.upstream.Stream(upstreamCtx, provider, upstream.ModelConfig{ModelID: snap.NativeModelID, MaxOutputTokens: snap.MaxOutputTokens, Reasoning: snap.Reasoning, Metadata: snap.DiscoveryMetadata}, history, func(text string) error {
 			select {
 			case updates <- streamUpdate{text: text}:
 				return nil
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-upstreamCtx.Done():
+				return upstreamCtx.Err()
 			}
 		})
 		select {
 		case updates <- streamUpdate{metadata: meta, err: e, terminal: true}:
-		case <-ctx.Done():
+		case <-upstreamCtx.Done():
 		}
 	}()
 	queue := make(chan streamUpdate, streamQueueItems)
 	credits := newStreamCreditLedger()
 	writeErr := make(chan error, 1)
 	writerExited := make(chan struct{})
+	// Writes survive request cancellation long enough to drain accepted text, but
+	// share one bounded deadline during finalization rather than one per batch.
+	persistenceCtx, stopPersistence := context.WithCancel(context.Background())
+	defer stopPersistence()
 	go func() {
 		defer close(writerExited)
 		var batch []byte
@@ -436,18 +448,22 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 			default:
 			}
 		}
-		// flush persists the merged batch with one atomic statement and emits it
-		// only after the database confirmed the write.
+		// Only successful persistence returns byte capacity. Queued, merged and
+		// currently writing text therefore share the same outstanding byte budget.
 		flush := func() error {
 			if len(batch) == 0 {
 				return nil
 			}
 			text := string(batch)
 			batch = batch[:0]
-			if err := a.appendDelta(uid, cid, in.GenerationID, in.AssistantMessageID, text); err != nil {
+			writeCtx, cancelWrite := context.WithTimeout(persistenceCtx, 10*time.Second)
+			err := a.appendDeltaContext(writeCtx, uid, cid, in.GenerationID, in.AssistantMessageID, text)
+			cancelWrite()
+			if err != nil {
 				return err
 			}
-			return emit(map[string]any{"type": "delta", "assistantMessageId": in.AssistantMessageID, "content": text})
+			credits.release(len(text))
+			return nil
 		}
 		for {
 			if len(batch) == 0 {
@@ -456,7 +472,6 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 					if !ok {
 						return
 					}
-					credits.release(len(update.text))
 					batch = append(batch, update.text...)
 					timer = time.NewTimer(streamMergeWindow)
 					window = timer.C
@@ -471,7 +486,6 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 					}
 					return
 				}
-				credits.release(len(update.text))
 				batch = append(batch, update.text...)
 				if len(batch) >= streamBatchLimit {
 					stopWindow()
@@ -511,16 +525,21 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 	// the bounded queue is full, so a slow database back-pressures the upstream
 	// instead of queueing without limit or writing out of order.
 	deliver := func(text string) bool {
-		if len(text) <= streamQueueBytes {
-			for pendingBytes+len(text) > streamQueueBytes {
-				select {
-				case <-credits.ready:
-					pendingBytes -= credits.take()
-				case <-writerExited:
-					return false
-				case <-ctx.Done():
-					return false
-				}
+		select {
+		case <-writerExited:
+			return false
+		case <-ctx.Done():
+			return false
+		default:
+		}
+		for pendingBytes+len(text) > streamQueueBytes {
+			select {
+			case <-credits.ready:
+				pendingBytes -= credits.take()
+			case <-writerExited:
+				return false
+			case <-ctx.Done():
+				return false
 			}
 		}
 		pendingBytes += len(text)
@@ -541,6 +560,8 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 	// returns the first persistence failure, if any.
 	drainQueue := func() error {
 		closeQueue()
+		deadline := time.AfterFunc(10*time.Second, stopPersistence)
+		defer deadline.Stop()
 		<-writerExited
 		return writeFailure()
 	}
@@ -548,12 +569,20 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 		if ctx.Err() != nil || errors.Is(err, errInactive) {
 			return "stopped", err
 		}
-		return "failed", errors.New("回答保存失败，请稍后重试。")
+		return "failed", errSaveFailed
 	}
 	terminate := func(status string, e error, meta json.RawMessage) {
+		// EOF is not completion while accepted text is still being saved. A stop
+		// during that wait wins before we attempt the terminal transaction.
+		if ctx.Err() != nil {
+			status, e, meta = "stopped", ctx.Err(), nil
+		}
 		var problem *messageError
 		if status == "failed" {
 			problem = &messageError{Code: "UPSTREAM_FAILED", Message: "回答生成失败，请重试。"}
+			if errors.Is(e, errSaveFailed) {
+				problem.Code = "SAVE_FAILED"
+			}
 			if e != nil && !errors.Is(e, errInactive) {
 				problem.Message = e.Error()
 			}
@@ -563,12 +592,24 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 			envelope, _ = json.Marshal(metadataEnvelope{ProviderID: snap.ProviderID, NativeModelID: snap.NativeModelID, CredentialFingerprint: security.HashToken(provider.APIKey), Value: meta})
 		}
 		saved, saveErr := a.finish(uid, cid, in.GenerationID, status, problem, envelope)
-		if saveErr != nil || !saved {
+		if saveErr != nil {
+			// Failure to persist the terminal transaction is also a saving error.
+			// Error delivery must not depend on the failed database recovering.
+			problem = &messageError{Code: "SAVE_FAILED", Message: errSaveFailed.Error()}
+			_, _ = a.finish(uid, cid, in.GenerationID, "failed", problem, nil)
+			if ctx.Err() == nil {
+				_ = emit(map[string]any{"type": "error", "assistantMessageId": in.AssistantMessageID, "code": problem.Code, "message": problem.Message})
+			}
+			return
+		}
+		if !saved && (problem == nil || problem.Code != "SAVE_FAILED") {
 			return
 		}
 		if status == "completed" {
-			_ = emit(map[string]any{"type": "done", "assistantMessageId": in.AssistantMessageID})
-		} else if problem != nil {
+			if ctx.Err() == nil {
+				_ = emit(map[string]any{"type": "done", "assistantMessageId": in.AssistantMessageID})
+			}
+		} else if problem != nil && ctx.Err() == nil {
 			_ = emit(map[string]any{"type": "error", "assistantMessageId": in.AssistantMessageID, "code": problem.Code, "message": problem.Message})
 		}
 	}
@@ -576,6 +617,7 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 	// and only then reports done/error. A failed save can never be reported as
 	// success.
 	finalize := func(status string, e error, meta json.RawMessage) {
+		stopUpstream()
 		if err := drainQueue(); err != nil {
 			status, e = saveFailure(err)
 		}
@@ -624,14 +666,45 @@ func (a *App) generate(w http.ResponseWriter, r *http.Request) {
 				finalize("failed", errors.New("回答超过大小限制。"), nil)
 				return
 			}
-			if !deliver(update.text) {
-				if err := writeFailure(); err != nil {
-					status, e := saveFailure(err)
-					finalize(status, e, nil)
+			// A native text event can exceed the queue budget. Split at UTF-8
+			// boundaries before admission so no event bypasses byte backpressure.
+			remaining := update.text
+			for len(remaining) > 0 {
+				length := min(len(remaining), streamBatchLimit)
+				if length < len(remaining) {
+					for !utf8.RuneStart(remaining[length]) {
+						length--
+					}
+				}
+				text := remaining[:length]
+				if !deliver(text) {
+					if err := writeFailure(); err != nil {
+						status, e := saveFailure(err)
+						finalize(status, e, nil)
+						return
+					}
+					finalize("stopped", ctx.Err(), nil)
 					return
 				}
-				finalize("stopped", ctx.Err(), nil)
-				return
+				select {
+				case <-ctx.Done():
+					finalize("stopped", ctx.Err(), nil)
+					return
+				case <-writerExited:
+					if err := writeFailure(); err != nil {
+						status, e := saveFailure(err)
+						finalize(status, e, nil)
+					} else {
+						finalize("stopped", nil, nil)
+					}
+					return
+				default:
+				}
+				if err := emit(map[string]any{"type": "delta", "assistantMessageId": in.AssistantMessageID, "content": text}); err != nil {
+					finalize("stopped", err, nil)
+					return
+				}
+				remaining = remaining[length:]
 			}
 		}
 	}

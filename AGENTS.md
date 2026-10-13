@@ -61,6 +61,8 @@ pnpm server:build    # 构建真实前端 dist 及 .cache/bin 中的服务二进
 
 `server:test` 的套件超时为 25 分钟，保留全部断言；远端数据库往返较高时完整套件可能超过 Go 默认 10 分钟。测试夹具初始化另外使用 90 秒超时。性能测试单独串行运行，不与数据库 suite/E2E 同时执行：`RUN_PERFORMANCE=1` 启用 `TestGenerationStagePerformance`，每协议预热一次并采样 30 次；`PERF_IMPLEMENTATION` 标注当前或实际 Git 基线，`PERF_OUTPUT_DIR` 指向忽略的测试产物目录。不得用重构的近似旧实现代替基线，不把网络写入计数称为数据包计数。浏览器生产预览测量增量接收到 DOM 的延迟；单独的 React profiling 构建才能报告纯渲染耗时和实际消息函数执行数，必须注明 profiling 开销且不把钩子加入正常产品构建。测试专用性能时点接口只在 `cmd/testserver` 中存在，记录虚构样本的标识与时间，不记录正文或凭据。
 
+浏览器 30 次性能采样在常规 E2E 中跳过，仅在独占窗口设置 `RUN_BROWSER_PERFORMANCE=1` 后运行 `pnpm exec playwright test tests/e2e/performance.spec.ts --project=backend --workers=1`，结束移除该变量。Go 性能入口为 `node scripts/performance.mjs current` / `node scripts/performance.mjs 29483aa`；新输出默认保存到忽略的 `test-results/performance-parallel-v2/`，与历史保存后发送样本分开。正文到发送和到保存按片段分别关联，保存耗时与最终排空等待单独报告。
+
 首次 E2E 前运行 `pnpm exec playwright install chromium`。本机已安装 Chrome，可使用：
 
 ```powershell
@@ -122,6 +124,8 @@ openspec validate build-chat-frontend --strict
 - 三个场景使用同一固定长回答；failure 在第三个增量后失败，同一回答重试成功。
 - 真实模式不注册 Mock，不使用生命周期桥接，不在服务失败时回退假数据；无后端时显示接口错误。
 - 生成使用 POST fetch 和 NDJSON，取消传递 AbortSignal。Go 接入需验证连接关闭后的服务端取消，跨来源服务配置 CORS。
+- 2026-10-13 用户确认真实模式正文发送与数据库保存并行：初始消息对和快照仍原子保存，正文进入有界队列后即发送，顺序合并写入；全部正文和终态保存成功才发 done。队列额度包含正在写入的字节，饱和时向上游背压；保存失败明确提示，刷新或服务崩溃仅恢复已保存部分，最新显示尾段可能丢失。新约定以 `fix-provider-setup-and-chat-experience` 为准，覆盖历史交接中的逐批保存后发送保证。
+- 真实模式刷新读到排空中的非终态前缀时只读重取，终态后停止，不因缺少本地 active 自动停止其他标签页。服务端仅按单实例活动任务表识别已退出的孤立生成并用原生成围栏恢复 stopped；仍运行或排空的任务保持原生命周期。
 - 浏览器环境变量不得存放模型密钥。
 
 ## 数据与验收

@@ -344,8 +344,8 @@ func TestClientDisconnectCancelsUpstreamAndKeepsDurablePartialAnswer(t *testing.
 		t.Fatalf("unexpected visible delta: %+v", event)
 	}
 	messages := readLifecycleConversation(t, f)
-	if len(messages) != 2 || messages[1].Content != event.Content {
-		t.Fatal("visible delta was not durable")
+	if len(messages) != 2 || !strings.HasPrefix(event.Content, messages[1].Content) {
+		t.Fatal("database snapshot is not a prefix of the live response")
 	}
 	cancel()
 	response.Body.Close()

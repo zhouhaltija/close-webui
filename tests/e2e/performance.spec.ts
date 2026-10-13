@@ -61,7 +61,7 @@ async function configure(page: Page) {
 
 type FragmentTiming = { marker: string; received: number; dom: number; frame: number };
 type BrowserTiming = {
-  t0: number; preview: number; first: number; submitStart: number; headers: number;
+  t0: number; preview: number; first: number; submitStart: number; headers: number; done: number; lastDelta: number;
   fragments: FragmentTiming[]; longTasks: number[]; oldMutations: number;
   uiUpdates: number; welcomeOverlap: boolean; hidden: boolean; oldProfileIds: string[]; cleanup: () => void;
 };
@@ -77,7 +77,7 @@ async function sample(page: Page) {
   await page.evaluate(() => {
     const oldProfileIds = Object.keys(window.__profileStats?.executions ?? {});
     if (window.__profileStats) { window.__profileStats.executions = {}; window.__profileStats.records = []; }
-    const m: BrowserTiming = { t0: 0, preview: 0, first: 0, submitStart: 0, headers: 0, fragments: [], longTasks: [], oldMutations: 0, uiUpdates: 0, welcomeOverlap: false, hidden: document.hidden, oldProfileIds, cleanup: () => {} };
+    const m: BrowserTiming = { t0: 0, preview: 0, first: 0, submitStart: 0, headers: 0, done: 0, lastDelta: 0, fragments: [], longTasks: [], oldMutations: 0, uiUpdates: 0, welcomeOverlap: false, hidden: document.hidden, oldProfileIds, cleanup: () => {} };
     window.__performanceSample = m;
     const oldArticles = new Set(document.querySelectorAll('.assistant-message'));
     const oldUserCount = document.querySelectorAll('[data-testid="message-user"]').length;
@@ -101,8 +101,10 @@ async function sample(page: Page) {
               const event = JSON.parse(line) as { type: string; content?: string };
               if (event.type === 'delta') {
                 const at = performance.now();
+                m.lastDelta = at;
                 for (const marker of event.content?.match(/【P[0-9]{3}】/g) ?? []) m.fragments.push({ marker, received: at, dom: 0, frame: 0 });
               }
+              if (event.type === 'done') m.done = performance.now();
             } catch { /* Blank/heartbeat line is not a body delta. */ }
           }
           controller.enqueue(chunk);
@@ -166,6 +168,8 @@ async function sample(page: Page) {
         clickToPreview: m.preview ? m.preview - m.t0 : -1,
         clickToFirstDelta: m.first ? m.first - m.t0 : -1,
         clickToSubmitRequest: m.submitStart - m.t0, submitToResponseHeaders: m.headers - m.submitStart,
+        doneEpochMs: m.done ? performance.timeOrigin + m.done : -1,
+        lastDeltaToDoneMs: m.done && m.lastDelta ? m.done - m.lastDelta : -1,
         fragments: m.fragments.map(f => ({ marker: f.marker, receivedMs: f.received - m.t0, domMs: f.dom - m.t0, frameMs: f.frame - m.t0, domEpochMs: performance.timeOrigin + f.dom, receiptToDomMs: f.dom - f.received, receiptToFrameMs: f.frame - f.received })),
         longTasks: m.longTasks, oldMessageMutations: m.oldMutations, uiUpdates: m.uiUpdates,
         welcomeOverlap: m.welcomeOverlap, hidden: m.hidden,
@@ -184,12 +188,13 @@ const percentile = (values: number[], p: number) => {
 const summary = (values: number[]) => ({ p50: percentile(values, 50), p95: percentile(values, 95), max: Math.max(...values) });
 
 test('fixed 50ms simulation measures receipt-to-DOM latency across 30 foreground sends', async ({ page }, testInfo) => {
+  test.skip(process.env.RUN_BROWSER_PERFORMANCE !== '1', '性能采样仅在独立串行窗口运行，设置 RUN_BROWSER_PERFORMANCE=1。');
   test.setTimeout(900_000);
   if (profileImplementation) await page.addInitScript(() => { window.__profileStats = { executions: {}, records: [] }; });
   const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
   await register(page); await configure(page);
   await mkdir('test-results', { recursive: true });
-  const samples: (Awaited<ReturnType<typeof sample>> & { index: number; warmup: boolean; firstTextDelayMs: number; upstreamToDomMs: number[] })[] = [];
+  const samples: (Awaited<ReturnType<typeof sample>> & { index: number; warmup: boolean; firstTextDelayMs: number; upstreamToDomMs: number[]; upstreamLastTextToDoneMs: number })[] = [];
   for (let i = 0; i < SAMPLES + 1; i++) {
     await page.getByRole('button', { name: '新对话', exact: true }).click();
     await expect(page.locator('.welcome h2')).toBeVisible();
@@ -212,7 +217,8 @@ test('fixed 50ms simulation measures receipt-to-DOM latency across 30 foreground
       expect(point).toBeDefined();
       return fragment.domEpochMs - point!.sendEpochMs;
     });
-    samples.push({ index: i, warmup: i === 0, firstTextDelayMs: delay, upstreamToDomMs, ...result });
+    const upstreamLastTextToDoneMs = result.doneEpochMs - upstreamTiming.points[41].sendEpochMs;
+    samples.push({ index: i, warmup: i === 0, firstTextDelayMs: delay, upstreamToDomMs, upstreamLastTextToDoneMs, ...result });
     await expect(page.getByTestId('message-assistant').last()).toContainText('性能采样');
   }
   const measured = samples.slice(1), foreground = measured.filter(s => !s.hidden);
@@ -226,6 +232,10 @@ test('fixed 50ms simulation measures receipt-to-DOM latency across 30 foreground
     receiptToDomMs: summary(foreground.flatMap(s => s.fragments.map(f => f.receiptToDomMs))),
     receiptToFrameMs: summary(foreground.flatMap(s => s.fragments.map(f => f.receiptToFrameMs))),
     upstreamToDomMs: summary(foreground.flatMap(s => s.upstreamToDomMs)),
+    lastDeltaToDoneMs: summary(measured.map(s => s.lastDeltaToDoneMs)),
+    upstreamLastTextToDoneMs: summary(measured.map(s => s.upstreamLastTextToDoneMs)),
+    allSamplesReceiptToDomMs: summary(measured.flatMap(s => s.fragments.map(f => f.receiptToDomMs))),
+    endTimingSemantics: 'done is actual NDJSON receipt after backend confirms all body and terminal saves; lastDeltaToDone includes remaining persistence and transport. Upstream last-text send to done is a broader bound, not an exact native terminal-to-save duration; the Go harness measures native terminal/COMMIT/Flush separately. No assertion-wait durations are used. Raw includes every measured and warmup sample; foreground-only summaries cannot certify success if any page was hidden.',
     renderActualMs: profileImplementation ? summary(foreground.flatMap(s => s.renderActualMs)) : null,
     oldMessageExecutionsTotal: profileImplementation ? foreground.reduce((sum, s) => sum + s.oldMessageExecutions, 0) : null,
     longTaskCount: foreground.reduce((sum, s) => sum + s.longTasks.length, 0),
@@ -238,10 +248,12 @@ test('fixed 50ms simulation measures receipt-to-DOM latency across 30 foreground
   const reportPath = testInfo.outputPath('performance-browser.json');
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`);
   await testInfo.attach('performance-browser', { path: reportPath, contentType: 'application/json' });
-  await writeFile(`test-results/performance-browser${profileImplementation ? `-${profileImplementation}` : ''}.json`, `${JSON.stringify(report, null, 2)}\n`);
+  await mkdir('test-results/performance-parallel-v2', { recursive: true });
+  await writeFile(`test-results/performance-parallel-v2/performance-browser${profileImplementation ? `-${profileImplementation}` : ''}.json`, `${JSON.stringify(report, null, 2)}\n`);
   console.log(`PERF preview p95=${report.clickToPreview.p95} | receiptToDom p95=${report.receiptToDomMs.p95} | receiptToFrame p95=${report.receiptToFrameMs.p95} | oldMutations=${report.oldMessageMutationsTotal}`);
   expect(report.foregroundSamples, 'hidden pages cannot certify foreground latency').toBe(SAMPLES);
   expect(measured.every(s => s.clickToPreview >= 0 && s.fragments.length === 42)).toBe(true);
+  expect(measured.every(s => s.doneEpochMs > 0 && s.lastDeltaToDoneMs >= 0 && s.upstreamLastTextToDoneMs >= 0)).toBe(true);
   if (profileImplementation === '29483aa') {
     // Baseline reports its real failures instead of imposing the new goals.
     expect(foreground.flatMap(s => s.renderActualMs).length).toBeGreaterThan(0);

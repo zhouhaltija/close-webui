@@ -43,11 +43,12 @@ type stageQuery struct {
 	writes     int64
 }
 type stageRun struct {
-	mu               sync.Mutex
-	start, connected time.Time
-	body, flush      []stagePoint
-	queries          []stageQuery
-	writes           atomic.Int64
+	mu                sync.Mutex
+	start, connected  time.Time
+	upstreamEnd, done time.Time
+	body, flush       []stagePoint
+	queries           []stageQuery
+	writes            atomic.Int64
 }
 type stageConn struct {
 	net.Conn
@@ -72,7 +73,10 @@ func (s *stageRun) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.Trace
 		q.kind = "legacy-append"
 		q.text, _ = d.Args[0].(string)
 	}
-	if q.kind != "atomic" && q.kind != "legacy-append" && q.kind != "begin" && q.kind != "commit" {
+	if strings.Contains(d.SQL, "UPDATE generations SET status=$1") && len(d.Args) > 0 && d.Args[0] == "completed" {
+		q.kind = "terminal"
+	}
+	if q.kind != "atomic" && q.kind != "legacy-append" && q.kind != "terminal" && q.kind != "begin" && q.kind != "commit" {
 		q.kind = "other"
 	}
 	return context.WithValue(ctx, stageQueryKey{}, stageQueryPending{q, s.writes.Load()})
@@ -127,6 +131,12 @@ func (b *stageBody) Read(p []byte) (int, error) {
 			continue
 		}
 		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if string(data) == "[DONE]" {
+			b.run.mu.Lock()
+			b.run.upstreamEnd = at
+			b.run.mu.Unlock()
+			continue
+		}
 		if !json.Valid(data) {
 			continue
 		}
@@ -135,6 +145,12 @@ func (b *stageBody) Read(p []byte) (int, error) {
 		for _, marker := range stageMarker.FindAllString(string(data), -1) {
 			b.run.mu.Lock()
 			b.run.body = append(b.run.body, stagePoint{marker, at})
+			b.run.mu.Unlock()
+		}
+		// These explicit terminal frames belong only to the fixed native fixture.
+		if bytes.Contains(data, []byte(`"response.completed"`)) || bytes.Contains(data, []byte(`"finishReason":"STOP"`)) || bytes.Contains(data, []byte(`"message_stop"`)) {
+			b.run.mu.Lock()
+			b.run.upstreamEnd = at
 			b.run.mu.Unlock()
 		}
 	}
@@ -160,9 +176,17 @@ func (w *stageWriter) FlushError() error {
 	at := time.Now()
 	for _, line := range bytes.Split(w.pending, []byte{'\n'}) {
 		var event struct{ Type, Content string }
-		if json.Unmarshal(line, &event) == nil && event.Type == "delta" {
+		if json.Unmarshal(line, &event) != nil {
+			continue
+		}
+		if event.Type == "delta" {
 			w.run.mu.Lock()
 			w.run.flush = append(w.run.flush, stagePoint{event.Content, at})
+			w.run.mu.Unlock()
+		}
+		if event.Type == "done" {
+			w.run.mu.Lock()
+			w.run.done = at
 			w.run.mu.Unlock()
 		}
 	}
@@ -248,6 +272,17 @@ func (t stageDelayTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 type stageFragmentReport struct {
 	Index                                                                      int `json:"index"`
 	BodyMs, DeltaStartMs, DeltaCommitMs, FlushMs, BodyToFlushMs, PersistenceMs float64
+	BodyToCommitMs, SaveLagMs                                                  float64
+}
+type stageBatchReport struct {
+	Index, Bytes                     int
+	Markers                          []string
+	StartMs, CommitMs, PersistenceMs float64
+	NetworkWrites                    int64
+}
+type stageProgressReport struct {
+	AtMs                                                float64
+	FlushedBytes, CommittedBytes, DisplayedUnsavedBytes int
 }
 type stageSampleReport struct {
 	Index                                                                    int
@@ -258,6 +293,122 @@ type stageSampleReport struct {
 	SQLStatements, DeltaBatches                                              int
 	DeltaNetworkWrites                                                       []int64
 	Fragments                                                                []stageFragmentReport
+	SaveBatches                                                              []stageBatchReport
+	Progress                                                                 []stageProgressReport
+	PeakDisplayedUnsavedBytes                                                int
+	UpstreamEndMs, TerminalCommitMs, DoneMs, FinalDrainMs, FinalNotifyMs     float64
+	DatabaseSelect1Ms                                                        float64
+}
+
+func TestStageAssociations(t *testing.T) {
+	origin := time.Now()
+	points := []stagePoint{{"【P000】", origin}, {"【P001】", origin.Add(50 * time.Millisecond)}, {"【P002】", origin.Add(100 * time.Millisecond)}}
+	flushes := []stagePoint{{"【P000】a【P001】b", origin.Add(60 * time.Millisecond)}, {"【P002】c", origin.Add(110 * time.Millisecond)}}
+	queries := []stageQuery{{kind: "atomic", text: "【P000】a", start: origin.Add(40 * time.Millisecond), end: origin.Add(200 * time.Millisecond)}, {kind: "atomic", text: "【P001】b【P002】c", start: origin.Add(210 * time.Millisecond), end: origin.Add(400 * time.Millisecond)}}
+	result, err := stageAssociate(origin, points, flushes, queries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Fragments) != 3 || len(result.SaveBatches) != 2 {
+		t.Fatalf("unexpected association counts: %+v", result)
+	}
+	if result.Fragments[1].BodyToFlushMs != 10 || result.Fragments[1].BodyToCommitMs != 350 || result.Fragments[1].SaveLagMs != 340 {
+		t.Fatalf("send/save stages conflated: %+v", result.Fragments[1])
+	}
+	if result.PeakDisplayedUnsavedBytes != 33 {
+		t.Fatalf("want 33 displayed but unsaved UTF-8 bytes, got %d", result.PeakDisplayedUnsavedBytes)
+	}
+	_, err = stageAssociate(origin, points, flushes, queries[:1])
+	if err == nil {
+		t.Fatal("missing durable fragments must fail association")
+	}
+}
+
+func stageAssociate(origin time.Time, points, flushes []stagePoint, queries []stageQuery) (stageSampleReport, error) {
+	var result stageSampleReport
+	type progressPoint struct {
+		at                 time.Time
+		flushed, committed int
+	}
+	var progress []progressPoint
+	saved := map[string]stageBatchReport{}
+	flushed := map[string]time.Time{}
+	for _, flush := range flushes {
+		progress = append(progress, progressPoint{at: flush.at, flushed: len(flush.text)})
+		for _, marker := range stageMarker.FindAllString(flush.text, -1) {
+			if _, exists := flushed[marker]; exists {
+				return result, fmt.Errorf("duplicate flushed marker %s", marker)
+			}
+			flushed[marker] = flush.at
+		}
+	}
+	for qi, query := range queries {
+		if query.kind != "atomic" && query.kind != "legacy-append" {
+			continue
+		}
+		begin, commit := query.start, query.end
+		var networkWrites int64
+		if query.kind == "legacy-append" {
+			foundBegin, foundCommit := false, false
+			for j := qi - 1; j >= 0; j-- {
+				if queries[j].kind == "begin" {
+					begin = queries[j].start
+					foundBegin = true
+					break
+				}
+			}
+			for j := qi + 1; j < len(queries); j++ {
+				if queries[j].kind == "commit" {
+					commit = queries[j].end
+					foundCommit = true
+					break
+				}
+				if queries[j].kind == "begin" || queries[j].kind == "failed" {
+					break
+				}
+			}
+			if !foundBegin || !foundCommit {
+				return result, fmt.Errorf("legacy append has no completed transaction")
+			}
+		}
+		for _, batchQuery := range queries {
+			if !batchQuery.start.Before(begin) && !batchQuery.end.After(commit) {
+				networkWrites += batchQuery.writes
+			}
+		}
+		batch := stageBatchReport{Index: len(result.SaveBatches), Bytes: len(query.text), Markers: stageMarker.FindAllString(query.text, -1), StartMs: stageMs(begin.Sub(origin)), CommitMs: stageMs(commit.Sub(origin)), PersistenceMs: stageMs(commit.Sub(begin)), NetworkWrites: networkWrites}
+		result.SaveBatches = append(result.SaveBatches, batch)
+		result.DeltaNetworkWrites = append(result.DeltaNetworkWrites, networkWrites)
+		progress = append(progress, progressPoint{at: commit, committed: len(query.text)})
+		for _, marker := range batch.Markers {
+			if _, exists := saved[marker]; exists {
+				return result, fmt.Errorf("duplicate saved marker %s", marker)
+			}
+			saved[marker] = batch
+		}
+	}
+	for index, point := range points {
+		flush, hasFlush := flushed[point.text]
+		batch, hasSave := saved[point.text]
+		if !hasFlush || !hasSave {
+			return result, fmt.Errorf("fragment %s missing send or durable save association", point.text)
+		}
+		bodyMs, flushMs := stageMs(point.at.Sub(origin)), stageMs(flush.Sub(origin))
+		result.Fragments = append(result.Fragments, stageFragmentReport{Index: index, BodyMs: bodyMs, DeltaStartMs: batch.StartMs, DeltaCommitMs: batch.CommitMs, FlushMs: flushMs, BodyToFlushMs: flushMs - bodyMs, PersistenceMs: batch.PersistenceMs, BodyToCommitMs: batch.CommitMs - bodyMs, SaveLagMs: batch.CommitMs - flushMs})
+	}
+	if len(flushed) != len(points) || len(saved) != len(points) {
+		return result, fmt.Errorf("send/save marker coverage differs from native body")
+	}
+	sort.SliceStable(progress, func(i, j int) bool { return progress[i].at.Before(progress[j].at) })
+	var sentBytes, savedBytes int
+	for _, point := range progress {
+		sentBytes += point.flushed
+		savedBytes += point.committed
+		lag := max(0, sentBytes-savedBytes)
+		result.PeakDisplayedUnsavedBytes = max(result.PeakDisplayedUnsavedBytes, lag)
+		result.Progress = append(result.Progress, stageProgressReport{AtMs: stageMs(point.at.Sub(origin)), FlushedBytes: sentBytes, CommittedBytes: savedBytes, DisplayedUnsavedBytes: lag})
+	}
+	return result, nil
 }
 
 func stageMs(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -330,7 +481,7 @@ func TestGenerationStagePerformance(t *testing.T) {
 			})
 			t.Cleanup(func() { a.handler = originalHandler })
 			var raw []stageSampleReport
-			var bodyLatency, persistence, rtts []float64
+			var bodyLatency, persistence, rtts, bodyPersistence, saveLag []float64
 			for i := 0; i < 31; i++ {
 				start := time.Now()
 				cid := idOf(t, call(t, client, server.URL, "POST", "/conversations", map[string]string{"title": "虚构性能历史"}, 201))
@@ -344,6 +495,7 @@ func TestGenerationStagePerformance(t *testing.T) {
 				state.mu.Lock()
 				state.start = time.Now()
 				state.connected = time.Time{}
+				state.upstreamEnd, state.done = time.Time{}, time.Time{}
 				state.body = nil
 				state.flush = nil
 				state.queries = nil
@@ -385,6 +537,7 @@ func TestGenerationStagePerformance(t *testing.T) {
 				flushes := append([]stagePoint(nil), state.flush...)
 				queries := append([]stageQuery(nil), state.queries...)
 				origin, connected := state.start, state.connected
+				upstreamEnd, done := state.upstreamEnd, state.done
 				state.mu.Unlock()
 				result := stageSampleReport{Index: i, Warmup: i == 0, FirstTextDelayMs: delay, CreateMs: createMs, UpstreamConnectedMs: stageMs(connected.Sub(origin)), SQLStatements: len(queries), SQLNetworkWrites: state.writes.Load() - beforeWrites, DeltaBatches: len(flushes)}
 				var persisted, status string
@@ -396,7 +549,10 @@ func TestGenerationStagePerformance(t *testing.T) {
 					visible.WriteString(flush.text)
 				}
 				if persisted != visible.String() || status != "completed" {
-					t.Fatal("persisted response differs from flushed text or lacks completed status")
+					t.Fatalf("durable output mismatch: storedBytes=%d flushedBytes=%d status=%q saveFailure=%t upstreamFailure=%t done=%t", len(persisted), visible.Len(), status, bytes.Contains(data, []byte(`"code":"SAVE_FAILED"`)), bytes.Contains(data, []byte(`"code":"UPSTREAM_FAILED"`)), bytes.Contains(data, []byte(`"type":"done"`)))
+				}
+				if label == "current" && len(persisted) >= 1<<20 {
+					t.Fatal("fixture exceeds non-saturated queue byte bound")
 				}
 				for _, q := range queries {
 					if q.kind == "commit" && q.end.Before(connected) {
@@ -409,61 +565,54 @@ func TestGenerationStagePerformance(t *testing.T) {
 				}
 				result.FirstBodyMs = stageMs(points[0].at.Sub(origin))
 				result.FirstFlushMs = stageMs(flushes[0].at.Sub(origin))
-				measuredBatches := map[time.Time]bool{}
-				for index, p := range points {
-					matched := false
-					for _, f := range flushes {
-						if !strings.Contains(f.text, p.text) {
-							continue
+				association, err := stageAssociate(origin, points, flushes, queries)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result.Fragments = association.Fragments
+				result.SaveBatches = association.SaveBatches
+				result.DeltaNetworkWrites = association.DeltaNetworkWrites
+				result.Progress = association.Progress
+				result.PeakDisplayedUnsavedBytes = association.PeakDisplayedUnsavedBytes
+				result.DatabaseSelect1Ms = rtt
+				result.UpstreamEndMs = stageMs(upstreamEnd.Sub(origin))
+				result.DoneMs = stageMs(done.Sub(origin))
+				if label == "29483aa" {
+					for _, fragment := range result.Fragments {
+						if fragment.SaveLagMs > 0 {
+							t.Fatal("actual legacy baseline must save before sending")
 						}
-						for qi, q := range queries {
-							if q.text != f.text || (q.kind != "atomic" && q.kind != "legacy-append") {
-								continue
-							}
-							begin, commit := q.start, q.end
-							if q.kind == "legacy-append" {
-								for j := qi - 1; j >= 0; j-- {
-									if queries[j].kind == "begin" {
-										begin = queries[j].start
-										break
-									}
-								}
-								for j := qi + 1; j < len(queries); j++ {
-									if queries[j].kind == "commit" {
-										commit = queries[j].end
-										break
-									}
-								}
-							}
-							if commit.After(f.at) {
-								t.Fatal("Flush preceded database commit")
-							}
-							latency := stageMs(f.at.Sub(p.at))
-							durable := stageMs(commit.Sub(begin))
-							result.Fragments = append(result.Fragments, stageFragmentReport{index, stageMs(p.at.Sub(origin)), stageMs(begin.Sub(origin)), stageMs(commit.Sub(origin)), stageMs(f.at.Sub(origin)), latency, durable})
-							if !measuredBatches[f.at] {
-								var networkWrites int64
-								for _, batchQuery := range queries {
-									if !batchQuery.start.Before(begin) && !batchQuery.end.After(commit) {
-										networkWrites += batchQuery.writes
-									}
-								}
-								result.DeltaNetworkWrites = append(result.DeltaNetworkWrites, networkWrites)
-								if i > 0 {
-									persistence = append(persistence, durable)
-								}
-								measuredBatches[f.at] = true
-							}
-							if i > 0 {
-								bodyLatency = append(bodyLatency, latency)
-							}
-							matched = true
+					}
+				}
+				for _, batch := range result.SaveBatches {
+					if batch.CommitMs > result.DoneMs {
+						t.Fatal("done preceded a body commit")
+					}
+				}
+				for qi, query := range queries {
+					if query.kind != "terminal" {
+						continue
+					}
+					for _, following := range queries[qi+1:] {
+						if following.kind == "commit" {
+							result.TerminalCommitMs = stageMs(following.end.Sub(origin))
 							break
 						}
-						break
 					}
-					if !matched {
-						t.Fatalf("fragment %d has no matching persisted Flush", index)
+				}
+				if upstreamEnd.IsZero() || done.IsZero() || result.TerminalCommitMs <= 0 || result.TerminalCommitMs > result.DoneMs {
+					t.Fatal("missing terminal timings or done preceded terminal commit")
+				}
+				result.FinalDrainMs = result.TerminalCommitMs - result.UpstreamEndMs
+				result.FinalNotifyMs = result.DoneMs - result.UpstreamEndMs
+				if i > 0 {
+					for _, fragment := range result.Fragments {
+						bodyLatency = append(bodyLatency, fragment.BodyToFlushMs)
+						bodyPersistence = append(bodyPersistence, fragment.BodyToCommitMs)
+						saveLag = append(saveLag, fragment.SaveLagMs)
+					}
+					for _, batch := range result.SaveBatches {
+						persistence = append(persistence, batch.PersistenceMs)
 					}
 				}
 				if i > 0 {
@@ -473,21 +622,43 @@ func TestGenerationStagePerformance(t *testing.T) {
 			}
 			p95 := stagePercentile(bodyLatency, .95)
 			persistence95 := stagePercentile(persistence, .95)
-			report := map[string]any{"implementation": label, "protocol": protocol, "samples": 30, "warmupSamples": 1, "fixture": "42 native text chunks, 50ms cadence, >20k characters, table/code; first-text delay 0/500/2000ms (10 sends each)", "semantics": "native complete valid JSON text line receipt before adapter -> successful underlying ResponseController.Flush completion; actual PostgreSQL durable query/transaction completion; all milliseconds relative to POST start; networkWrites counts net.Conn.Write calls (not claimed as packets)", "bodyToFlushMs": map[string]float64{"p50": stagePercentile(bodyLatency, .5), "p95": p95}, "persistenceMs": map[string]float64{"p50": stagePercentile(persistence, .5), "p95": persistence95}, "databaseSelect1Ms": map[string]float64{"p50": stagePercentile(rtts, .5), "p95": stagePercentile(rtts, .95)}, "targetMs": persistence95 + 100, "meetsBodyToFlushTarget": p95 <= persistence95+100, "raw": raw}
+			target := float64(100)
+			if label == "29483aa" {
+				target = persistence95 + 100
+			}
+			report := map[string]any{
+				"implementation": label, "protocol": protocol, "samples": 30, "warmupSamples": 1,
+				"fixture":           "42 native text chunks, 50ms cadence, >20k characters, table/code; first-text delay 0/500/2000ms (10 sends each)",
+				"semantics":         "complete valid native JSON text line receipt before adapter -> successful underlying Flush; independent marker association to real PostgreSQL atomic query/legacy COMMIT; relative milliseconds; net.Conn.Write calls are not packet counts; all 30 samples and all fragment latencies retained",
+				"bodyToFlushMs":     map[string]float64{"p50": stagePercentile(bodyLatency, .5), "p95": p95},
+				"bodyToCommitMs":    map[string]float64{"p50": stagePercentile(bodyPersistence, .5), "p95": stagePercentile(bodyPersistence, .95)},
+				"saveLagMs":         map[string]float64{"p50": stagePercentile(saveLag, .5), "p95": stagePercentile(saveLag, .95)},
+				"persistenceMs":     map[string]float64{"p50": stagePercentile(persistence, .5), "p95": persistence95},
+				"databaseSelect1Ms": map[string]float64{"p50": stagePercentile(rtts, .5), "p95": stagePercentile(rtts, .95)},
+				"targetMs":          target, "legacyTargetMs": persistence95 + 100, "meetsBodyToFlushTarget": p95 <= target, "raw": raw,
+				"queueObservation":      "DisplayedUnsavedBytes is Flush-progress minus durable commit-progress, a lower bound on internal unsaved queue bytes. Queue acceptance, internal queue peak and exact backpressure intervals are not observed; no production hooks are added. This fixed fixture cannot saturate the current queue: its entire text fits below 1MiB and its 42 input fragments below 128 items, including in-flight text. Dedicated database stress regression tests cover actual backpressure separately.",
+				"backpressureIntervals": nil,
+			}
 			report["timestampDefinitions"] = map[string]string{
-				"CreateMs":            "POST create conversation response fully received, measured separately before generation",
-				"SubmitCommitMs":      "initial generation transaction COMMIT completed, relative to POST generation start",
-				"UpstreamConnectedMs": "native HTTP response headers received, not TCP connect duration",
-				"BodyMs":              "complete valid native text JSON line read, before adapter parsing",
-				"DeltaCommitMs":       "atomic query completion or actual legacy COMMIT completion, never intermediate UPDATE completion",
-				"FlushMs":             "underlying ResponseController.Flush returned successfully",
+				"CreateMs":                  "POST create conversation response fully received, measured separately before generation",
+				"SubmitCommitMs":            "initial generation transaction COMMIT completed, relative to POST generation start",
+				"UpstreamConnectedMs":       "native HTTP response headers received, not TCP connect duration",
+				"BodyMs":                    "complete valid native text JSON line read, before adapter parsing",
+				"DeltaCommitMs":             "atomic query completion or actual legacy COMMIT completion, never intermediate UPDATE completion",
+				"FlushMs":                   "underlying ResponseController.Flush returned successfully",
+				"SaveLagMs":                 "marker durable commit minus marker Flush; signed, negative for save-before-send baseline",
+				"UpstreamEndMs":             "complete native successful terminal frame received before adapter parsing",
+				"PeakDisplayedUnsavedBytes": "peak successful Flush bytes minus confirmed commit bytes, lower bound on queued+merged+in-flight text",
+				"TerminalCommitMs":          "completed-state transaction COMMIT completion",
+				"FinalDrainMs":              "native terminal frame receipt to completed-state transaction COMMIT; includes remaining body saves and terminal transaction",
+				"DoneMs":                    "underlying successful Flush of done; all body and terminal saves must precede it",
 			}
 			stageValues := map[string][]float64{}
 			for _, sample := range raw {
 				if sample.Warmup {
 					continue
 				}
-				for name, value := range map[string]float64{"create": sample.CreateMs, "submitCommit": sample.SubmitCommitMs, "upstreamHeaders": sample.UpstreamConnectedMs, "firstBody": sample.FirstBodyMs, "firstFlush": sample.FirstFlushMs} {
+				for name, value := range map[string]float64{"create": sample.CreateMs, "submitCommit": sample.SubmitCommitMs, "upstreamHeaders": sample.UpstreamConnectedMs, "firstBody": sample.FirstBodyMs, "firstFlush": sample.FirstFlushMs, "finalDrain": sample.FinalDrainMs, "finalNotify": sample.FinalNotifyMs} {
 					stageValues[name] = append(stageValues[name], value)
 				}
 			}
@@ -499,6 +670,7 @@ func TestGenerationStagePerformance(t *testing.T) {
 			dir := os.Getenv("PERF_OUTPUT_DIR")
 			if dir == "" {
 				dir = filepath.Join("..", "..", "..", "test-results")
+				dir = filepath.Join(dir, "performance-parallel-v2")
 			}
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				t.Fatal(err)
@@ -508,11 +680,8 @@ func TestGenerationStagePerformance(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Logf("%s %s body-to-Flush p95 %.2fms; persistence p95 %.2fms; SELECT 1 p95 %.2fms", label, protocol, p95, persistence95, stagePercentile(rtts, .95))
-			if label == "current" && p95 > persistence95+100 {
-				t.Errorf("body-to-Flush p95 %.2f > persistence p95 %.2f + 100ms", p95, persistence95)
-			}
-			if label == "current" && persistence95 <= 100 && p95 > 200 {
-				t.Errorf("body-to-Flush p95 %.2f > 200ms for persistence <=100ms", p95)
+			if label == "current" && p95 > 100 {
+				t.Errorf("non-saturated body-to-Flush p95 %.2f > 100ms", p95)
 			}
 		})
 	}

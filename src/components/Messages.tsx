@@ -33,13 +33,13 @@ function MessageBody({ message }: { message: Message }) {
   </div>;
 }
 /** Rendered once per unchanged message: only the streaming answer re-renders on a delta. */
-export const MessageView = memo(function MessageView({ message, canRetry, onRetry }: { message: Message; canRetry: boolean; onRetry: () => void }) {
+export const MessageView = memo(function MessageView({ message, canRetry, onRetry, canRecover, recoveryDisabled, onRecover }: { message: Message; canRetry: boolean; onRetry: () => void; canRecover?: boolean; recoveryDisabled?: boolean; onRecover?: () => void }) {
   if (message.role === 'user') return <article className="user-message" data-testid="message-user"><div>{message.content}</div></article>;
   return <article className="assistant-message" data-testid="message-assistant" data-status={message.status}>
     <div className="assistant-heading"><Mark /><span>CloseWebUI</span></div>
     <MessageBody message={message} />
     {message.status === 'stopped' && <p className="message-status">已停止生成</p>}
-    {message.status === 'failed' && <div className="message-error" role="alert">{message.error?.message || '回答中断了，请重试。'}{canRetry && <button onClick={onRetry}><RotateCcw size={14} />重试回答</button>}</div>}
+    {message.status === 'failed' && <div className="message-error" role="alert">{message.error?.message || '回答中断了，请重试。'}{canRecover && <> 当前显示的部分正文可能尚未保存，刷新仅恢复已保存内容。<button disabled={recoveryDisabled} onClick={onRecover}>恢复已保存内容</button></>}{canRetry && <button onClick={onRetry}><RotateCcw size={14} />重试回答</button>}</div>}
     {message.content && !['pending', 'streaming'].includes(message.status) && <div className="message-actions"><CopyButton text={message.content} label="复制回答" /></div>}
   </article>;
-}, (previous, next) => previous.message === next.message && previous.canRetry === next.canRetry);
+}, (previous, next) => previous.message === next.message && previous.canRetry === next.canRetry && previous.canRecover === next.canRecover && previous.recoveryDisabled === next.recoveryDisabled);

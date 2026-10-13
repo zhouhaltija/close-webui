@@ -14,7 +14,7 @@ const log = await open(resolve(root, `.cache/performance-${label}.log`), 'w');
 const cachedGo = resolve(root, '.cache/toolchain/go/bin', process.platform === 'win32' ? 'go.exe' : 'go');
 const child = spawn(existsSync(cachedGo) ? cachedGo : 'go', ['-C', resolve(workspace, 'server'), 'test', './internal/app', '-run', '^TestGenerationStagePerformance$', '-count=1', '-v', '-timeout=30m'], {
   cwd: root, windowsHide: true, stdio: ['ignore', log.fd, log.fd],
-  env: { ...process.env, GOCACHE: resolve(root, '.cache/go-build'), GOPATH: resolve(root, '.cache/go-path'), GOMODCACHE: resolve(root, '.cache/go-mod'), RUN_PERFORMANCE: '1', PERF_IMPLEMENTATION: label, PERF_OUTPUT_DIR: resolve(root, 'test-results') },
+  env: { ...process.env, GOCACHE: resolve(root, '.cache/go-build'), GOPATH: resolve(root, '.cache/go-path'), GOMODCACHE: resolve(root, '.cache/go-mod'), RUN_PERFORMANCE: '1', PERF_IMPLEMENTATION: label, PERF_OUTPUT_DIR: process.env.PERF_OUTPUT_DIR || resolve(root, 'test-results/performance-parallel-v2') },
 });
 child.on('error', error => { console.error(error.message); process.exitCode = 1; });
 child.on('exit', async code => { await log.close(); console.log(`Performance ${label} exit ${code}`); process.exitCode = code ?? 1; });

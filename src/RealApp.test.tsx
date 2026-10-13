@@ -3,13 +3,14 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { App } from './App';
+import { GenerationCoordinator } from './core/generation';
 import { useUI } from './core/ui-store';
 import type { Conversation, GenerationInput, MessageStatus } from './core/types';
 
 afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); useUI.setState({ drafts: {}, busy: false, error: '', realModelId: null, reasoning: {} }); });
-function mount(path = '/') {
+function mount(path = '/', staleTime = Infinity) {
   vi.stubEnv('VITE_ENABLE_MOCK', 'false');
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime } } });
   render(<QueryClientProvider client={client}><MemoryRouter initialEntries={[path]}><Routes><Route path="/" element={<App />} /><Route path="/chat/:conversationId" element={<App />} /><Route path="/settings/:section" element={<App />} /><Route path="/settings/providers/:providerId" element={<App />} /></Routes></MemoryRouter></QueryClientProvider>);
   return client;
 }
@@ -53,6 +54,193 @@ function submissionFixture() {
     ] }),
   };
 }
+
+it.each([
+  ['pending', 'stopped'],
+  ['streaming', 'completed'],
+] as const)('refreshes a server-owned %s answer until it becomes %s without stopping it', async (initial, terminal) => {
+  const fixture = submissionFixture(); let savedStatus: MessageStatus = initial;
+  let reads = 0; const stops: string[] = [];
+  const input: GenerationInput = { userMessageId: 'u-old', assistantMessageId: 'a-old', generationId: 'g-old', content: '刷新前的问题', modelId: 'm1', retry: false };
+  fixture.read(async () => { reads++; return fixture.saved(input, savedStatus, '数据库确认的前缀'); });
+  fixture.stop(async id => { stops.push(id); return new Response(null, { status: 204 }); });
+  mount('/chat/c1');
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', initial));
+  await waitFor(() => expect(reads).toBeGreaterThan(1), { timeout: 3500 });
+  expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', initial);
+  expect(stops).toEqual([]);
+  savedStatus = terminal;
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', terminal), { timeout: 3500 });
+  expect(screen.getByRole('button', { name: '复制回答' })).toBeVisible();
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('数据库确认的前缀');
+  expect(screen.queryByLabelText('正在生成')).not.toBeInTheDocument();
+  const terminalReads = reads;
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 2200)); });
+  expect(reads).toBe(terminalReads);
+  expect(stops).toEqual([]);
+  expect(fixture.inputs).toEqual([]);
+}, 10000);
+
+it('keeps the live answer visible when a refetch returns a shorter saved prefix', async () => {
+  const fixture = submissionFixture(); let stream!: ReadableStreamDefaultController<Uint8Array>;
+  fixture.generate(async () => new Response(new ReadableStream({ start(controller) { stream = controller; } })));
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '流式问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await waitFor(() => expect(fixture.inputs).toHaveLength(1));
+  const submitted = fixture.inputs[0];
+  const emit = (event: object) => stream.enqueue(new TextEncoder().encode(`${JSON.stringify({ assistantMessageId: submitted.assistantMessageId, ...event })}\n`));
+  act(() => { emit({ type: 'delta', content: '已保存前缀与实时尾段' }); });
+  await screen.findByText('已保存前缀与实时尾段');
+  fixture.read(async () => fixture.saved(submitted, 'streaming', '已保存前缀'));
+  await act(async () => { await client.refetchQueries({ queryKey: ['conversation', 'c1'] }); });
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages[1].content).toBe('已保存前缀与实时尾段');
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('已保存前缀与实时尾段');
+  expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', 'streaming');
+  expect(screen.getAllByTestId('message-user')).toHaveLength(1);
+  act(() => { emit({ type: 'delta', content: '以及后续正文' }); emit({ type: 'done' }); });
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', 'completed'));
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('已保存前缀与实时尾段以及后续正文');
+  fixture.read(async () => fixture.saved(submitted, 'completed', '权威完成正文'));
+  await act(async () => { await client.refetchQueries({ queryKey: ['conversation', 'c1'] }); });
+  await screen.findByText('权威完成正文');
+  expect(screen.getByTestId('message-assistant')).not.toHaveTextContent('实时尾段');
+});
+
+it('keeps the submitting pair when the new chat’s initial GET returns an empty saved snapshot', async () => {
+  const fixture = submissionFixture(); let resolveRead!: (conversation: Conversation) => void; let accept!: () => void;
+  fixture.read(() => new Promise(resolve => { resolveRead = resolve; }));
+  fixture.generate(input => new Promise(resolve => { accept = () => resolve(new Response(`${JSON.stringify({ type: 'done', assistantMessageId: input.assistantMessageId })}\n`)); }));
+  const client = mount('/', 0); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '创建后的问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByText('正在提交…'); await waitFor(() => expect(resolveRead).toBeDefined());
+  await act(async () => { resolveRead(fixture.conversation); });
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages.map(message => [message.role, message.content, message.phase])).toEqual([['user', '创建后的问题', undefined], ['assistant', '', 'submitting']]);
+  expect(screen.getByTestId('message-user')).toHaveTextContent('创建后的问题');
+  expect(screen.queryByText('给这个对话一个起点')).not.toBeInTheDocument();
+  await act(async () => { accept(); });
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', 'completed'));
+});
+
+it.each(['done', 'stop'] as const)('ignores a shorter GET begun during streaming that returns after %s', async terminal => {
+  const fixture = submissionFixture(); let stream!: ReadableStreamDefaultController<Uint8Array>;
+  fixture.generate(async () => new Response(new ReadableStream({ start(controller) { stream = controller; } })));
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '查询竞态问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await waitFor(() => expect(fixture.inputs).toHaveLength(1)); const submitted = fixture.inputs[0];
+  const emit = (event: object) => stream.enqueue(new TextEncoder().encode(`${JSON.stringify({ assistantMessageId: submitted.assistantMessageId, ...event })}\n`));
+  act(() => { emit({ type: 'delta', content: '前缀' }); }); await screen.findByText('前缀');
+  let resolveRead!: (snapshot: Conversation) => void;
+  fixture.read(() => new Promise(resolve => { resolveRead = resolve; }));
+  const refetch = client.refetchQueries({ queryKey: ['conversation', 'c1'] });
+  await waitFor(() => expect(resolveRead).toBeDefined());
+  act(() => { emit({ type: 'delta', content: '与后来的尾段' }); }); await screen.findByText('前缀与后来的尾段');
+  if (terminal === 'done') act(() => { emit({ type: 'done' }); });
+  else fireEvent.click(screen.getByRole('button', { name: '停止生成' }));
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', terminal === 'done' ? 'completed' : 'stopped'));
+  await act(async () => { resolveRead(fixture.saved(submitted, 'streaming', '前缀')); await refetch; });
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages[1]).toMatchObject({ content: '前缀与后来的尾段', status: terminal === 'done' ? 'completed' : 'stopped' });
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('前缀与后来的尾段');
+  fixture.read(async () => fixture.saved(submitted, terminal === 'done' ? 'completed' : 'stopped', '新读取的权威正文'));
+  await act(async () => { await client.refetchQueries({ queryKey: ['conversation', 'c1'] }); });
+  await screen.findByText('新读取的权威正文');
+});
+
+it.each(['failure', 'cancel'] as const)('releases the snapshot guard after query %s while preserving later streamed completion', async outcome => {
+  const reads: ((snapshot: Conversation) => Conversation)[] = [];
+  const capture = GenerationCoordinator.prototype.captureSnapshot;
+  const captureSpy = vi.spyOn(GenerationCoordinator.prototype, 'captureSnapshot').mockImplementation(function(this: GenerationCoordinator, id) {
+    const read = capture.call(this, id); reads.push(read); return read;
+  });
+  try {
+    const fixture = submissionFixture(); let stream!: ReadableStreamDefaultController<Uint8Array>;
+    fixture.generate(async () => new Response(new ReadableStream({ start(controller) { stream = controller; } })));
+    const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+    fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '查询释放问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+    await waitFor(() => expect(fixture.inputs).toHaveLength(1)); const submitted = fixture.inputs[0];
+    let resolveRead!: (snapshot: Conversation) => void; let rejectRead!: (error: Error) => void;
+    fixture.read(() => new Promise((resolve, reject) => { resolveRead = resolve; rejectRead = reject; }));
+    const refetch = client.refetchQueries({ queryKey: ['conversation', 'c1'] });
+    await waitFor(() => expect(resolveRead).toBeDefined()); const read = reads.at(-1)!;
+    await act(async () => {
+      if (outcome === 'failure') rejectRead(new TypeError('offline'));
+      else await client.cancelQueries({ queryKey: ['conversation', 'c1'] });
+      await refetch;
+    });
+    act(() => {
+      stream.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: 'delta', assistantMessageId: submitted.assistantMessageId, content: '查询结束后的完整正文' })}\n${JSON.stringify({ type: 'done', assistantMessageId: submitted.assistantMessageId })}\n`));
+    });
+    await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', 'completed'));
+    expect(screen.getByTestId('message-assistant')).toHaveTextContent('查询结束后的完整正文');
+    const saved = fixture.saved(submitted, 'stopped', '数据库的保存前缀');
+    expect(read(saved).messages[1]).toMatchObject({ content: '数据库的保存前缀', status: 'stopped' });
+    if (outcome === 'cancel') await act(async () => { resolveRead(saved); });
+    expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages[1]).toMatchObject({ content: '查询结束后的完整正文', status: 'completed' });
+  } finally { captureSpy.mockRestore(); }
+});
+
+it('explains saving failure and keeps the live tail until explicit saved-content recovery', async () => {
+  const fixture = submissionFixture(); let stream!: ReadableStreamDefaultController<Uint8Array>;
+  fixture.generate(async () => new Response(new ReadableStream({ start(controller) { stream = controller; } })));
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '保存故障问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await waitFor(() => expect(fixture.inputs).toHaveLength(1));
+  const submitted = fixture.inputs[0];
+  act(() => {
+    stream.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: 'delta', assistantMessageId: submitted.assistantMessageId, content: '已保存前缀与尚未保存尾段' })}\n`));
+    stream.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: 'error', assistantMessageId: submitted.assistantMessageId, code: 'SAVE_FAILED', message: '保存失败。' })}\n`));
+  });
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).toHaveAttribute('data-status', 'failed'));
+  expect(screen.getByRole('alert')).toHaveTextContent(/保存失败/);
+  expect(screen.getByRole('alert')).toHaveTextContent(/刷新.*已保存/);
+  expect(screen.queryByRole('button', { name: '重试回答' })).not.toBeInTheDocument();
+  fixture.read(async () => fixture.saved(submitted, 'failed', '已保存前缀'));
+  await act(async () => { await client.refetchQueries({ queryKey: ['conversation', 'c1'] }); });
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('已保存前缀与尚未保存尾段');
+  fixture.read(async () => { throw new TypeError('offline'); });
+  fireEvent.click(screen.getByRole('button', { name: '恢复已保存内容' }));
+  await screen.findByText(/无法恢复已保存内容/);
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('已保存前缀与尚未保存尾段');
+  fixture.read(async () => fixture.saved(submitted, 'failed', '已保存前缀'));
+  fireEvent.click(screen.getByRole('button', { name: '恢复已保存内容' }));
+  await waitFor(() => expect(screen.getByTestId('message-assistant')).not.toHaveTextContent('尚未保存尾段'));
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('已保存前缀');
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages[1].content).toBe('已保存前缀');
+  expect(fixture.inputs).toHaveLength(1);
+});
+
+it('cancels saved-content recovery without leaving the chat or accepting its delayed snapshot', async () => {
+  const fixture = submissionFixture();
+  fixture.generate(async input => new Response(`${JSON.stringify({ type: 'delta', assistantMessageId: input.assistantMessageId, content: '仍在页面的实时正文' })}\n${JSON.stringify({ type: 'error', assistantMessageId: input.assistantMessageId, code: 'SAVE_FAILED', message: '保存失败。' })}\n`));
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '保存问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByRole('button', { name: '恢复已保存内容' });
+  let resolveRead!: (conversation: Conversation) => void;
+  fixture.read(() => new Promise(resolve => { resolveRead = resolve; }));
+  fireEvent.click(screen.getByRole('button', { name: '恢复已保存内容' }));
+  fireEvent.click(await screen.findByRole('button', { name: '停止生成' }));
+  await act(async () => { resolveRead(fixture.saved(fixture.inputs[0], 'failed', '迟到的保存前缀')); });
+  expect(screen.getByRole('heading', { name: '提交测试' })).toBeVisible();
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('仍在页面的实时正文');
+  expect(client.getQueryData<Conversation>(['conversation', 'c1'])!.messages[1].content).toBe('仍在页面的实时正文');
+  expect(fixture.inputs).toHaveLength(1);
+});
+
+it('keeps failed-save text, copying and recovery visible when the saved snapshot cannot be refetched', async () => {
+  const fixture = submissionFixture();
+  fixture.generate(async input => new Response(`${JSON.stringify({ type: 'delta', assistantMessageId: input.assistantMessageId, content: '故障时仍可复制的正文' })}\n${JSON.stringify({ type: 'error', assistantMessageId: input.assistantMessageId, code: 'SAVE_FAILED', message: '保存失败。' })}\n`));
+  const client = mount('/chat/c1'); await screen.findByRole('button', { name: '选择真实模型：测试模型' });
+  fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '数据库故障问题' } }); fireEvent.click(screen.getByRole('button', { name: '发送消息' }));
+  await screen.findByRole('button', { name: '恢复已保存内容' });
+  fixture.read(async () => { throw new TypeError('offline'); });
+  await act(async () => { await client.refetchQueries({ queryKey: ['conversation', 'c1'] }); });
+  expect(client.getQueryState(['conversation', 'c1'])!.status).toBe('error');
+  await screen.findByText(/无法加载最新已保存内容/);
+  expect(screen.getByTestId('message-assistant')).toHaveTextContent('故障时仍可复制的正文');
+  expect(screen.getByRole('button', { name: '复制回答' })).toBeVisible();
+  expect(screen.getByRole('button', { name: '恢复已保存内容' })).toBeVisible();
+  expect(screen.queryByRole('heading', { name: '无法加载对话' })).not.toBeInTheDocument();
+  expect(fixture.inputs).toHaveLength(1);
+});
 
 it('removes a rejected submission from the visible history and cache before a second send while keeping a newer draft', async () => {
   const fixture = submissionFixture(); let rejectSubmission!: (response: Response) => void;
